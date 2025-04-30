@@ -120,4 +120,4 @@ RETFound weights and Vision Transformer implementation from RETFound_MAE.
 Inspired by Vision Transformer and U-Net architectures.
 
 Contact
-For questions or issues, please open an issue on GitHub or contact [alireza.hayati@example.com].
+For questions or issues, please open an issue on GitHub or contact [alirezahayati17@yahoo.com].
