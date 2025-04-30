@@ -1,0 +1,15 @@
+Python
+
+pycache/ *.pyc *.pyo *.pyd .Python env/ venv/ *.egg-info/
+
+Data and weights
+
+data/ weights/.pth weights/.h5 *.h5
+
+Temporary files
+
+*.log *.cache *.DS_Store
+
+Jupyter
+
+*.ipynb_checkpoints/
