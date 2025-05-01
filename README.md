@@ -146,7 +146,5 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Contact
 
 For questions or issues, please open an issue on GitHub or contact [alirezahayati17@yahoo.com].
-```
 
----
 
