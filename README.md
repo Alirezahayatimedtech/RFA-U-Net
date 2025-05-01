@@ -119,13 +119,13 @@ To visualize segmentation results on a specific image:
 
 ## Results
 
-- **Validation Dice Score**: ~0.92 (average across folds)  
-- **Test Dice Score**: ~0.91  
+
+- **Test Dice Score**: ~0.95  
 - **Boundary Errors**:  
-  - Upper Signed Error: ~5.2 μm  
-  - Upper Unsigned Error: ~6.8 μm  
-  - Lower Signed Error: ~4.9 μm  
-  - Lower Unsigned Error: ~7.1 μm  
+  - Upper Signed Error: ~-0.89 μm 
+  - Upper Unsigned Error: ~6.04 μm 
+  - Lower Signed Error: ~1.05 μm  
+  - Lower Unsigned Error: ~21.4 μm 
 
 ## Example Output
 ![download](https://github.com/user-attachments/assets/f86b0c96-b683-47f1-9cf5-d159c40cc59a)
@@ -147,6 +147,13 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 For questions or issues, please open an issue on GitHub or contact [alirezahayati17@yahoo.com].
 ---
+## 🤝 Contributors
+
+Thanks to the following people for their contributions:
+
+- (https://github.com/alirezahayatimedtech) – Initial development
+- (https://github.com/royaarian101) – Helped with training experiments
+- (https://github.com/narges-sa) – Helped with training experiments
 
 ## 📌 Tags / Hashtags
 
