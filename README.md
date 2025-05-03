@@ -222,6 +222,4 @@ Thanks to the following contributors:
 \#UNet #RETFound #ComputerVision #MedicalAI #SemanticSegmentation
 \#PyTorch #AIinHealthcare #ImageSegmentation #BiomedicalImaging
 
----
 
-Let me know if you'd like this in a `.md` file or want to embed a Colab badge!
