@@ -8,6 +8,7 @@ weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -20,20 +21,39 @@ from sklearn.metrics import confusion_matrix
 from timm.models.layers import trunc_normal_
 import models_vit
 from util.pos_embed import interpolate_pos_embed
+import argparse
 
 # Constants
 PIXEL_SIZE_MICROMETERS = 10.35  # Pixel size in micrometers
-NUM_EPOCHS = 50
-BATCH_SIZE = 8
 
-# Configuration
+# Command-line argument parser
+def parse_args():
+    parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
+    parser.add_argument('--image_dir', type=str, default='data/images',
+                        help='Path to the directory containing OCT images')
+    parser.add_argument('--mask_dir', type=str, default='data/masks',
+                        help='Path to the directory containing mask images')
+    parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
+                        help='Path to the pre-trained weights file')
+    parser.add_argument('--image_size', type=int, default=224,
+                        help='Input image size')
+    parser.add_argument('--num_epochs', type=int, default=50,
+                        help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for training')
+    return parser.parse_args()
+
+# Parse arguments
+args = parse_args()
+
+# Configuration based on command-line arguments
 config = {
-    "image_size": 224,
+    "image_size": args.image_size,
     "hidden_dim": 1024,
     "patch_size": 16,
     "num_channels": 3,
     "num_classes": 2,
-    "retfound_weights_path": "weights/RETFound_oct_weights.pth"
+    "retfound_weights_path": args.weights_path
 }
 
 # Convolutional block for decoder
@@ -112,20 +132,6 @@ class AttentionUNetViT(nn.Module):
         )
         # Modify patch embedding for 3-channel input
         self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
-        # Load pre-trained weights
-        if not os.path.exists(config["retfound_weights_path"]):
-            raise FileNotFoundError(f"Weights file not found: {config['retfound_weights_path']}")
-        checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
-        checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
-        state_dict = self.encoder.state_dict()
-        for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
-        interpolate_pos_embed(self.encoder, checkpoint_model)
-        msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
-        print("Loaded weights, missing keys:", msg.missing_keys)
-        trunc_normal_(self.encoder.head.weight, std=2e-5)
 
         # Decoder blocks
         self.d1 = DecoderBlock([1024, 1024], 512)
@@ -223,6 +229,74 @@ def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
         unsigned_errors.append(unsigned_error)
     return np.mean(signed_errors), np.mean(unsigned_errors)
 
+# Visualization Function
+def plot_boundaries(images, true_masks, predicted_masks):
+    """
+    Plots the original image, true mask, predicted mask, and boundaries.
+    Also computes and displays the mean signed and unsigned errors in micrometers.
+
+    Parameters:
+    images (torch.Tensor): Batch of original images.
+    true_masks (torch.Tensor): Batch of true masks.
+    predicted_masks (torch.Tensor): Batch of predicted masks.
+    """
+    batch_size = images.size(0)
+
+    for i in range(batch_size):
+        image = images[i].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format for RGB
+        true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
+        predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
+
+        predicted_mask_binary = (predicted_mask > 0.5).astype(np.uint8)
+        true_mask_binary = (true_mask > 0.5).astype(np.uint8)
+
+        # Get boundaries
+        pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
+        gt_upper, gt_lower = find_boundaries(true_mask_binary)
+
+        # Compute errors in micrometers
+        upper_signed_error, upper_unsigned_error = compute_errors(pred_upper, gt_upper, PIXEL_SIZE_MICROMETERS)
+        lower_signed_error, lower_unsigned_error = compute_errors(pred_lower, gt_lower, PIXEL_SIZE_MICROMETERS)
+
+        # Print errors
+        print(f"Image {i + 1}:")
+        print(f"Upper Boundary Signed Error: {upper_signed_error:.2f} μm")
+        print(f"Upper Boundary Unsigned Error: {upper_unsigned_error:.2f} μm")
+        print(f"Lower Boundary Signed Error: {lower_signed_error:.2f} μm")
+        print(f"Lower Boundary Unsigned Error: {lower_unsigned_error:.2f} μm")
+
+        # Create boundary visualization
+        combined_image = image.copy()
+        for col in range(len(pred_upper)):
+            if gt_upper[col] is not None:
+                combined_image[gt_upper[col], col] = [1, 0, 0]  # Red for true upper boundary
+            if gt_lower[col] is not None:
+                combined_image[gt_lower[col], col] = [0, 1, 0]  # Green for true lower boundary
+            if pred_upper[col] is not None:
+                combined_image[pred_upper[col], col] = [0, 0, 1]  # Blue for predicted upper boundary
+            if pred_lower[col] is not None:
+                combined_image[pred_lower[col], col] = [1, 1, 0]  # Yellow for predicted lower boundary
+
+        # Plotting
+        plt.figure(figsize=(16, 8))
+        plt.subplot(1, 4, 1)
+        plt.imshow(image)
+        plt.title('Original Image')
+        plt.axis('off')
+        plt.subplot(1, 4, 2)
+        plt.imshow(true_mask_binary, cmap='gray')
+        plt.title('True Mask')
+        plt.axis('off')
+        plt.subplot(1, 4, 3)
+        plt.imshow(predicted_mask_binary, cmap='gray')
+        plt.title('Predicted Mask')
+        plt.axis('off')
+        plt.subplot(1, 4, 4)
+        plt.imshow(combined_image)
+        plt.title('Boundaries\n(True Upper: Red, True Lower: Green, Pred Upper: Blue, Pred Lower: Yellow)')
+        plt.axis('off')
+        plt.show()
+
 # Dataset Class
 class OCTDataset(Dataset):
     def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
@@ -257,16 +331,16 @@ class OCTDataset(Dataset):
 
 # Data Transforms
 train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((args.image_size, args.image_size)),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomRotation(degrees=15),
     transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0)),
+    transforms.RandomResizedCrop(size=(args.image_size, args.image_size), scale=(0.8, 1.0)),
     transforms.ToTensor(),
 ])
 
 val_test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((args.image_size, args.image_size)),
     transforms.ToTensor(),
 ])
 
@@ -312,17 +386,33 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
     avg_upper_unsigned_error = np.mean(upper_unsigned_errors)
     avg_lower_signed_error = np.mean(lower_signed_errors)
     avg_lower_unsigned_error = np.mean(lower_unsigned_errors)
+
+    # Visualize the first batch from the test set
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            outputs = model(images)
+            outputs = torch.sigmoid(outputs)
+            masks = F.interpolate(masks, size=outputs.shape[2:], mode='nearest')
+            predicted_masks = (outputs > 0.5).float()
+            plot_boundaries(images, masks, predicted_masks)
+            break  # Visualize only the first batch
+
     return avg_dice, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
 
 # Main Execution
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionUNetViT(config).to(device)
+    # Load pre-trained RFA-U-Net weights if available
+    if os.path.exists(args.weights_path):
+        checkpoint = torch.load(args.weights_path, map_location=device)
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded pre-trained RFA-U-Net weights from {args.weights_path}")
     criterion = DiceLoss(smooth=1e-6).to(device)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.006622586228339055)
-    image_dir = '/content/drive/MyDrive/Alireza/data'
-    mask_dir = '/content/drive/MyDrive/Alireza/mask png'
-    full_dataset = OCTDataset(image_dir, mask_dir, transform=val_test_transform, num_classes=2)
+    full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
     valid_size = int(0.15 * len(full_dataset))
     test_size = len(full_dataset) - train_size - valid_size
@@ -330,11 +420,11 @@ if __name__ == "__main__":
     train_dataset.dataset.transform = train_transform
     valid_dataset.dataset.transform = val_test_transform
     test_dataset.dataset.transform = val_test_transform
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     dice, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
-        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, NUM_EPOCHS
+        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs
     )
     print(f"Validation Dice: {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
           f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
