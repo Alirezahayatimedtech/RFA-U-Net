@@ -50,12 +50,13 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Download the pre-trained RETFound weights (`RETFound_oct_weights.pth`) from this Google Drive link and place them in the `weights/` directory. See `weights/README.md` for details.
+The `weights/` directory contains the best pre-trained weights for RFA-U-Net:
 
-Clone the RETFound_MAE repository for model definitions:
-```bash
-git clone https://github.com/rmaphoh/RETFound_MAE.git
-```
+* `rfa_unet_weights.pth`: Best pre-trained weights for RFA-U-Net, which can be used directly for inference or further fine-tuning.
+
+See `weights/README.md` for instructions on downloading these weights.
+
+
 
 ## Dataset
 
@@ -94,7 +95,7 @@ config = {
     "patch_size": 16,
     "num_channels": 3,
     "num_classes": 2,
-    "retfound_weights_path": "weights/RETFound_oct_weights.pth"
+    "retfound_weights_path": "weights/rfa_unet_best.pth"
 }
 ```
 
@@ -160,5 +161,4 @@ Thanks to the following people for their contributions:
 #DeepLearning #MedicalImaging #OCT #ChoroidSegmentation #VisionTransformer  
 #UNet #RETFound #ComputerVision #MedicalAI #SemanticSegmentation  
 #PyTorch #AIinHealthcare #ImageSegmentation #BiomedicalImaging
-
 
