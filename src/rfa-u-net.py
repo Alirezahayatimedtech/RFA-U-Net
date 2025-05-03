@@ -24,9 +24,6 @@ from util.pos_embed import interpolate_pos_embed
 import argparse
 import gdown
 
-# Constants
-PIXEL_SIZE_MICROMETERS = 10.35  # Pixel size in micrometers
-
 # Command-line argument parser
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
@@ -35,13 +32,17 @@ def parse_args():
     parser.add_argument('--mask_dir', type=str, default='data/masks',
                         help='Path to the directory containing mask images')
     parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
-                        help='Path to the pre-trained weights file')
+                        help='Path to the pre-trained weights file (used if weights_type is rfa-unet)')
+    parser.add_argument('--weights_type', type=str, default='rfa-unet', choices=['retfound', 'rfa-unet'],
+                        help='Type of weights to load: "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224,
                         help='Input image size')
     parser.add_argument('--num_epochs', type=int, default=50,
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training')
+    parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
+                        help='Pixel size in micrometers for boundary error computation')
     return parser.parse_args()
 
 # Parse arguments
@@ -54,8 +55,15 @@ config = {
     "patch_size": 16,
     "num_channels": 3,
     "num_classes": 2,
-    "retfound_weights_path": args.weights_path
+    "retfound_weights_path": args.weights_path  # Will be updated based on weights_type
 }
+
+# Weights file paths
+RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
+RFA_UNET_WEIGHTS_PATH = "weights/rfa_unet_best.pth"
+
+# URL for downloading RFA-U-Net weights (replace with actual Google Drive file ID)
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=rfa-unet-placeholder-id"
 
 # Function to download weights if not present
 def download_weights(weights_path, url):
@@ -67,9 +75,17 @@ def download_weights(weights_path, url):
     else:
         print(f"Weights file already exists at {weights_path}")
 
-# Download pre-trained RFA-U-Net weights if not present
-weights_url = "https://drive.google.com/uc?id=placeholder-id"  # Replace with actual Google Drive file ID
-download_weights(args.weights_path, weights_url)
+# Download RFA-U-Net weights if not present
+if args.weights_type == 'rfa-unet':
+    download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
+
+# Determine which weights to load based on weights_type
+if args.weights_type == 'retfound':
+    config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
+    print("Using RETFound weights for training from scratch")
+elif args.weights_type == 'rfa-unet':
+    config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
+    print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
 
 # Convolutional block for decoder
 class ConvBlock(nn.Module):
@@ -147,6 +163,21 @@ class AttentionUNetViT(nn.Module):
         )
         # Modify patch embedding for 3-channel input
         self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
+        # Load RETFound weights if specified
+        if config["retfound_weights_path"] == RETFOUND_WEIGHTS_PATH:
+            if not os.path.exists(config["retfound_weights_path"]):
+                raise FileNotFoundError(f"Weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
+            checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
+            checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
+            state_dict = self.encoder.state_dict()
+            for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
+                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                    print(f"Removing key {k} from pretrained checkpoint")
+                    del checkpoint_model[k]
+            interpolate_pos_embed(self.encoder, checkpoint_model)
+            msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
+            print("Loaded RETFound weights, missing keys:", msg.missing_keys)
+            trunc_normal_(self.encoder.head.weight, std=2e-5)
 
         # Decoder blocks
         self.d1 = DecoderBlock([1024, 1024], 512)
@@ -270,8 +301,8 @@ def plot_boundaries(images, true_masks, predicted_masks):
         gt_upper, gt_lower = find_boundaries(true_mask_binary)
 
         # Compute errors in micrometers
-        upper_signed_error, upper_unsigned_error = compute_errors(pred_upper, gt_upper, PIXEL_SIZE_MICROMETERS)
-        lower_signed_error, lower_unsigned_error = compute_errors(pred_lower, gt_lower, PIXEL_SIZE_MICROMETERS)
+        upper_signed_error, upper_unsigned_error = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
+        lower_signed_error, lower_unsigned_error = compute_errors(pred_lower, gt_lower, args.pixel_size_micrometers)
 
         # Print errors
         print(f"Image {i + 1}:")
@@ -390,8 +421,8 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
                 true_mask_binary = (true_masks[i, 1] > 0.5).astype(np.uint8)
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
                 gt_upper, gt_lower = find_boundaries(true_mask_binary)
-                upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, PIXEL_SIZE_MICROMETERS)
-                lower_signed, lower_unsigned = compute_errors(pred_lower, gt_lower, PIXEL_SIZE_MICROMETERS)
+                upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
+                lower_signed, lower_unsigned = compute_errors(pred_lower, gt_lower, args.pixel_size_micrometers)
                 upper_signed_errors.append(upper_signed)
                 upper_unsigned_errors.append(upper_unsigned)
                 lower_signed_errors.append(lower_signed)
@@ -420,11 +451,11 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionUNetViT(config).to(device)
-    # Load pre-trained RFA-U-Net weights if available
-    if os.path.exists(args.weights_path):
-        checkpoint = torch.load(args.weights_path, map_location=device)
+    # Load pre-trained weights (either RETFound or RFA-U-Net based on weights_type)
+    if os.path.exists(config["retfound_weights_path"]):
+        checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
         model.load_state_dict(checkpoint, strict=False)
-        print(f"Loaded pre-trained RFA-U-Net weights from {args.weights_path}")
+        print(f"Loaded weights from {config['retfound_weights_path']}")
     criterion = DiceLoss(smooth=1e-6).to(device)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.006622586228339055)
     full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
