@@ -52,7 +52,7 @@ pip install -r requirements.txt
 
 The `weights/` directory contains the best pre-trained weights for RFA-U-Net:
 
-* `rfa_unet_weights.pth`: Best pre-trained weights for RFA-U-Net, which can be used directly for inference or further fine-tuning.
+* `rfa_unet_best.pth`: Best pre-trained weights for RFA-U-Net, which can be used directly for inference or further fine-tuning.
 
 See `weights/README.md` for instructions on downloading these weights.
 
