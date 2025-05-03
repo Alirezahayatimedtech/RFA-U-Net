@@ -14,7 +14,7 @@ RFA-U-Net is a deep learning model designed for segmenting the choroid in Optica
 ```
 RFA-U-Net/
 ├── src/
-│   ├── retfound.py           # Main model, training, and evaluation script
+│   ├── rfa-u-net.py           # Main model, training, and evaluation script
 │   └── util/
 │       └── pos_embed.py      # Utility for positional embedding interpolation
 ├── examples/
@@ -89,7 +89,7 @@ Train the model by specifying the dataset paths and other configurations via com
 
 
 ```
-python src/retfound.py --image_dir path/to/your/data/images --mask_dir path/to/your/data/masks --weights_path weights/rfa_unet_best.pth
+python src/rfa-u-net.py --image_dir path/to/your/data/images --mask_dir path/to/your/data/masks --weights_path weights/rfa_unet_best.pth
 ```
 This will train the model for 50 epochs, evaluate on the validation set, and visualize the first batch of the test set using plot_boundaries.
 
@@ -123,7 +123,7 @@ This will train the model for 50 epochs, evaluate on the validation set, and vis
 
 Example with custom settings:
 ```
-python src/retfound.py --image_dir my_data/images --mask_dir my_data/masks --weights_path weights/rfa_unet_best.pth --image_size 256 --num_epochs 30 --batch_size 4
+python src/rfa-u-net.py --image_dir my_data/images --mask_dir my_data/masks --weights_path weights/rfa_unet_best.pth --image_size 256 --num_epochs 30 --batch_size 4
 ```
 This will train the model for 50 epochs, evaluate on the validation set, and visualize the first batch of the test set using `plot_boundaries`.
 
