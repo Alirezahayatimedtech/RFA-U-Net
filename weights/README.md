@@ -1,30 +1,55 @@
-Here's a **cleaned-up, user-friendly, and Markdown-polished** version of your section, ready to be placed in your `weights/README.md` or main `README.md` file:
-
----
 
 ## 📦 Pre-trained Weights
 
-The pre-trained weights for **RFA-U-Net** (`rfa_unet_best.pth`) are automatically downloaded the first time you run the main script (`src/retfound.py`). These weights are the best checkpoint obtained after training on an OCT dataset and can be used directly for inference or further fine-tuning.
+The script (`src/rfa-u-net.py`) will automatically download or use the appropriate pre-trained weights based on the `--weights_type` argument.
+
+### 🎯 Available Weights
+
+* **`RETFound_oct_weights.pth`**
+  Pre-trained RETFound weights used to initialize the Vision Transformer encoder for **training from scratch**.
+  📥 **Manual download required** from the [RETFound\_MAE repository](https://github.com/rmaphoh/RETFound_MAE).
+
+* **`rfa_unet_best.pth`**
+  Best pre-trained weights for RFA-U-Net, trained on an OCT dataset.
+  ✅ Automatically downloaded on first use when running with `--weights_type rfa-unet`.
+  Suitable for **inference** or **fine-tuning**.
 
 ---
 
-## 📁 Details
+## 🔍 Weight Details
 
-* **File**: `rfa_unet_best.pth`
-* **Source**: Automatically downloaded from Google Drive
-* **Usage**: The script checks for the file and downloads it if missing. The weights support both inference and continued training (see instructions in [README.md](../README.md)).
+### `RETFound_oct_weights.pth`
+
+* **Source**: [RETFound\_MAE GitHub Repository](https://github.com/rmaphoh/RETFound_MAE)
+* **Usage**: Required when using `--weights_type retfound` to train RFA-U-Net from scratch
+* **Setup**: Must be manually downloaded and placed in the `weights/` directory
+
+### `rfa_unet_best.pth`
+
+* **Source**: Hosted on Google Drive
+* **Usage**: Used when `--weights_type rfa-unet` is specified for inference or continued training
+* **Setup**: Automatically downloaded if not already present (uses `gdown`)
 
 ---
 
 ## 📝 Notes
 
-* To **force re-download** of the weights, simply delete the existing `rfa_unet_best.pth` file in the `weights/` directory and re-run the script.
-* Make sure the `gdown` library is installed (it is included in `requirements.txt`) — it handles the download automatically.
+* To use **RETFound** weights:
+  You must manually download `RETFound_oct_weights.pth` from the [RETFound\_MAE repository](https://github.com/rmaphoh/RETFound_MAE) and place it in this directory **before** running the script with `--weights_type retfound`.
 
-```bash
-pip install gdown  # Only if needed manually
-```
+* To use **RFA-U-Net** pre-trained weights (`rfa_unet_best.pth`):
+  They are **automatically downloaded** if missing when running the script with `--weights_type rfa-unet`.
 
----
+* To **force re-download** of `rfa_unet_best.pth`:
+  Simply delete the file from the `weights/` directory and rerun the script.
 
-Let me know if you'd like to link this to an actual hosted file or include a direct `gdown` command with a shareable Google Drive ID.
+* Ensure the `gdown` package is installed (already included in `requirements.txt`) for automatic downloading.
+
+* When **evaluating boundary errors**, you can specify the pixel size in micrometers using:
+
+  ```bash
+  --pixel_size_micrometers 10.35  # default is 10.35 μm
+  ```
+
+  Adjust this based on your dataset’s imaging specs.
+
