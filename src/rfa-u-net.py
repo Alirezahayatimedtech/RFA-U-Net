@@ -22,6 +22,7 @@ from timm.models.layers import trunc_normal_
 import models_vit
 from util.pos_embed import interpolate_pos_embed
 import argparse
+import gdown
 
 # Constants
 PIXEL_SIZE_MICROMETERS = 10.35  # Pixel size in micrometers
@@ -55,6 +56,20 @@ config = {
     "num_classes": 2,
     "retfound_weights_path": args.weights_path
 }
+
+# Function to download weights if not present
+def download_weights(weights_path, url):
+    if not os.path.exists(weights_path):
+        print(f"Weights file not found at {weights_path}. Downloading...")
+        os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+        gdown.download(url, weights_path, quiet=False)
+        print(f"Weights downloaded to {weights_path}")
+    else:
+        print(f"Weights file already exists at {weights_path}")
+
+# Download pre-trained RFA-U-Net weights if not present
+weights_url = "https://drive.google.com/uc?id=placeholder-id"  # Replace with actual Google Drive file ID
+download_weights(args.weights_path, weights_url)
 
 # Convolutional block for decoder
 class ConvBlock(nn.Module):
