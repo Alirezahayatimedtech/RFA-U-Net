@@ -75,7 +75,7 @@ data/
 ```
 
 - **Images**: RGB OCT images (3 channels)  
-- **Masks**: Binary masks (single channel) for the choroid region  
+- **Masks**: Binary masks (single channel) for the choroid region
 
 **Note**: Due to privacy concerns, the dataset is not included. Users must provide their own OCT dataset with the above structure.
 
@@ -83,27 +83,48 @@ data/
 
 ### Training the Model
 
-1. Prepare the dataset: Ensure your dataset follows the structure above and is placed in a `data/` directory.
+Prepare the dataset: Ensure your dataset follows the structure above and is placed in a `data/` directory.
 
-2. Update the configuration in `src/retfound.py`:
-```python
-image_dir = 'path/to/your/data/images'
-mask_dir = 'path/to/your/data/masks'
-config = {
-    "image_size": 224,
-    "hidden_dim": 1024,
-    "patch_size": 16,
-    "num_channels": 3,
-    "num_classes": 2,
-    "retfound_weights_path": "weights/rfa_unet_best.pth"
-}
+Train the model by specifying the dataset paths and other configurations via command-line arguments:
+
+
 ```
-
-3. Train the model:
-```bash
-python src/retfound.py
+python src/retfound.py --image_dir path/to/your/data/images --mask_dir path/to/your/data/masks --weights_path weights/rfa_unet_best.pth
 ```
+This will train the model for 50 epochs, evaluate on the validation set, and visualize the first batch of the test set using plot_boundaries.
 
+### Available Command-Line Arguments:
+
+
+
+
+
+--image_dir: Path to the directory containing OCT images (default: data/images)
+
+
+
+--mask_dir: Path to the directory containing mask images (default: data/masks)
+
+
+
+--weights_path: Path to the pre-trained weights file (default: weights/rfa_unet_best.pth)
+
+
+
+--image_size: Input image size (default: 224)
+
+
+
+--num_epochs: Number of training epochs (default: 50)
+
+
+
+--batch_size: Batch size for training (default: 8)
+
+Example with custom settings:
+```
+python src/retfound.py --image_dir my_data/images --mask_dir my_data/masks --weights_path weights/rfa_unet_best.pth --image_size 256 --num_epochs 30 --batch_size 4
+```
 This will train the model for 50 epochs, evaluate on the validation set, and visualize the first batch of the test set using `plot_boundaries`.
 
 ### Visualizing Results
