@@ -212,7 +212,7 @@ Thanks to the following contributors:
 
 * **Alireza Hayati** – Initial development
 * **Roya Arian** – Helped with training experiments
-* **Narges Sa** – Helped with training experiments
+* **Narges Saedizadeh** – Helped with training experiments
 
 ---
 
