@@ -43,6 +43,8 @@ def parse_args():
                         help='Batch size for training')
     parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
                         help='Pixel size in micrometers for boundary error computation')
+    parser.add_argument('--threshold', type=float, default=0.3,
+                        help='Threshold for binarizing predicted masks (default: 0.3)')
     return parser.parse_args()
 
 # Parse arguments
@@ -305,7 +307,7 @@ def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
     return np.mean(signed_errors), np.mean(unsigned_errors)
 
 # Visualization Function
-def plot_boundaries(images, true_masks, predicted_masks):
+def plot_boundaries(images, true_masks, predicted_masks, threshold):
     """
     Plots the original image, true mask, predicted mask, and boundaries.
     Also computes and displays the mean signed and unsigned errors in micrometers.
@@ -314,6 +316,7 @@ def plot_boundaries(images, true_masks, predicted_masks):
     images (torch.Tensor): Batch of original images.
     true_masks (torch.Tensor): Batch of true masks.
     predicted_masks (torch.Tensor): Batch of predicted masks.
+    threshold (float): Threshold for binarizing predicted masks.
     """
     batch_size = images.size(0)
 
@@ -322,7 +325,7 @@ def plot_boundaries(images, true_masks, predicted_masks):
         true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
         predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
 
-        predicted_mask_binary = (predicted_mask > 0.5).astype(np.uint8)
+        predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
         true_mask_binary = (true_mask > 0.5).astype(np.uint8)
 
         # Get boundaries
@@ -420,7 +423,7 @@ val_test_transform = transforms.Compose([
 ])
 
 # Training and Evaluation Functions
-def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler):
+def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler, threshold):
     model.train()
     for epoch in range(num_epochs):
         running_loss = 0.0
@@ -451,7 +454,7 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            dice = dice_score(outputs, masks)  # Now computes Dice for choroid layer only
+            dice = dice_score(outputs, masks)  # Computes Dice for choroid layer only
             dice_scores.append(dice)
             predicted_masks = torch.sigmoid(outputs).cpu().numpy()
             true_masks = masks.cpu().numpy()
@@ -460,7 +463,7 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
                 true_mask = true_masks[i, 1]  # Choroid channel
                 print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
                 print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
-                predicted_mask_binary = (predicted_mask > 0.3).astype(np.uint8)
+                predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
                 true_mask_binary = (true_mask > 0.5).astype(np.uint8)
                 print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
@@ -485,8 +488,8 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             outputs = model(images)
             outputs = torch.sigmoid(outputs)
             masks = F.interpolate(masks, size=outputs.shape[2:], mode='nearest')
-            predicted_masks = (outputs > 0.5).float()
-            plot_boundaries(images, masks, predicted_masks)
+            predicted_masks = outputs  # Already sigmoid applied, no thresholding here for visualization
+            plot_boundaries(images, masks, predicted_masks, threshold)
             break  # Visualize only the first batch
 
     return avg_dice, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
@@ -522,7 +525,7 @@ if __name__ == "__main__":
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     dice, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
-        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler
+        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold
     )
     print(f"Validation Dice (Choroid Layer): {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
           f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
