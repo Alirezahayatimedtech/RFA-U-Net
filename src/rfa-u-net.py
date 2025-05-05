@@ -8,8 +8,6 @@ weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 import os
 import torch
 import torch.nn as nn
-
-
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
@@ -92,9 +90,6 @@ elif args.weights_type == 'rfa-unet':
         print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
 elif args.weights_type == 'none':
     print("No pre-trained weights specified. Initializing model with random weights.")
-    
-
-
 
 # Convolutional block for decoder
 class ConvBlock(nn.Module):
@@ -179,6 +174,8 @@ class AttentionUNetViT(nn.Module):
                     raise FileNotFoundError(f"RETFound weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
                 else:
                     raise FileNotFoundError(f"RFA-U-Net weights file not found: {config['retfound_weights_path']}. Please download rfa_unet_best.pth and place it in the weights/ directory.")
+            checkpoint = torch.load(config["retfound_weights_path"], map_location='cpu')
+            print(f"Checkpoint keys: {list(checkpoint.keys())}")
             checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
             if args.weights_type == 'retfound':
                 checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
@@ -299,7 +296,6 @@ def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
         print("Warning: No valid boundary pairs found for error computation. Returning 0.0.")
         return 0.0, 0.0
     return np.mean(signed_errors), np.mean(unsigned_errors)
-
 
 # Visualization Function
 def plot_boundaries(images, true_masks, predicted_masks):
@@ -427,8 +423,11 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             with autocast('cuda'):
                 outputs = model(images)
                 loss = criterion(outputs, masks)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
             running_loss += loss.item()
         print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader):.4f}")
 
@@ -443,8 +442,13 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             predicted_masks = torch.sigmoid(outputs).cpu().numpy()
             true_masks = masks.cpu().numpy()
             for i in range(images.size(0)):
-                predicted_mask_binary = (predicted_masks[i, 1] > 0.5).astype(np.uint8)
-                true_mask_binary = (true_masks[i, 1] > 0.5).astype(np.uint8)
+                predicted_mask = predicted_masks[i, 1]  # Choroid channel
+                true_mask = true_masks[i, 1]  # Choroid channel
+                print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
+                print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
+                predicted_mask_binary = (predicted_mask > 0.3).astype(np.uint8)
+                true_mask_binary = (true_mask > 0.5).astype(np.uint8)
+                print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
                 gt_upper, gt_lower = find_boundaries(true_mask_binary)
                 upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
@@ -477,13 +481,20 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionUNetViT(config).to(device)
+    # Freeze encoder layers to focus training on the decoder
+    frozen_layers = 23  # Freeze 23 of 24 encoder layers
+    encoder_layers = model.encoder.blocks
+    for i, layer in enumerate(encoder_layers):
+        if i < frozen_layers:
+            for param in layer.parameters():
+                param.requires_grad = False
     # Load pre-trained weights (either RETFound or RFA-U-Net based on weights_type)
     if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
         checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded weights from {config['retfound_weights_path']}")
     criterion = DiceLoss(smooth=1e-6).to(device)
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.006622586228339055)
     scaler = GradScaler('cuda')  # Initialize GradScaler for mixed precision 
     full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
