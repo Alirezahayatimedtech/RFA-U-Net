@@ -1,17 +1,18 @@
 
+
 # RFA-U-Net: RETFound Attention U-Net for OCT Choroid Segmentation
 
-**RFA-U-Net** is a deep learning model designed to segment the **choroid** in Optical Coherence Tomography (OCT) images. It combines a **Vision Transformer (ViT)** encoder pre-trained with **RETFound weights** and an **Attention U-Net** decoder. The model is optimized using **Tversky** and **Dice** loss functions and evaluated using metrics such as **Dice scores** and **boundary errors** (in micrometers).
+**RFA-U-Net** is a deep learning model designed to segment the **choroid** in Optical Coherence Tomography (OCT) images. It integrates a **Vision Transformer (ViT)** encoder pre-trained with **RETFound** weights and an **Attention U-Net** decoder. The model is trained using **Tversky** and **Dice** losses and evaluated with **Dice scores** and **boundary error metrics** (in micrometers).
 
 ---
 
 ## 🚀 Features
 
 * **Encoder**: RETFound Vision Transformer for robust feature extraction
-* **Decoder**: Attention U-Net with skip connections for precise segmentation
-* **Loss Functions**: Tversky and Dice loss to handle class imbalance
-* **Evaluation Metrics**: Dice score, signed/unsigned boundary errors (μm)
-* **Visualization**: Boundary overlays of true and predicted masks
+* **Decoder**: Attention U-Net with skip connections for precise choroid segmentation
+* **Loss Functions**: Tversky and Dice loss for class imbalance
+* **Evaluation Metrics**: Dice score, boundary errors (signed/unsigned, in micrometers)
+* **Visualization**: Boundary overlays with true and predicted masks
 
 ---
 
@@ -20,17 +21,17 @@
 ```
 RFA-U-Net/
 ├── src/
-│   ├── rfa-u-net.py          # Main model, training, and evaluation script
+│   ├── rfa-u-net.py          # Main model training/inference script
+│   ├── models_vit.py         # ViT implementation (adapted from RETFound_MAE)
 │   └── util/
-│       └── pos_embed.py      # Positional embedding interpolation utility
+│       └── pos_embed.py      # Positional embedding utility
 ├── examples/
-│   ├── sample_image.jpg      # Example OCT image
-│   ├── sample_mask.png       # Corresponding mask
-│   ├── sample_output.png     # Sample segmentation result
-│   └── visualization.ipynb   # Notebook for visualizing predictions
+│   ├── sample_image.jpg
+│   ├── sample_mask.png
+│   ├── sample_output.png
+│   └── visualization.ipynb   # Notebook for visualization
 ├── weights/
-│   ├── rfa_unet_best.pth     # Best pre-trained model
-│   └── README.md             # Info about pre-trained weights
+│   └── README.md             # Pre-trained weights info
 ├── .gitignore
 ├── LICENSE
 ├── README.md
@@ -63,13 +64,24 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+> **Note**: The script uses `gdown` to automatically download pre-trained weights (`rfa_unet_best.pth`) from Google Drive when `--weights_type rfa-unet` is specified.
+
 ---
 
 ## 📦 Pre-trained Weights
 
-The pre-trained model weights (`rfa_unet_best.pth`) will be **automatically downloaded** to the `weights/` directory the first time you run the script (`src/rfa-u-net.py`). These are the best weights saved after training on an OCT dataset.
+Pre-trained weights are optional. You may:
 
-See [`weights/README.md`](weights/README.md) for more details.
+* Train from scratch
+* Use **RETFound** weights (`RETFound_oct_weights.pth`) for ViT initialization
+* Use pre-trained **RFA-U-Net** weights (`rfa_unet_best.pth`) for fine-tuning or inference
+
+### Available Weights
+
+* `RETFound_oct_weights.pth`: Must be downloaded manually from the [RETFound\_MAE repo](https://github.com/rmaphoh/RETFound_MAE) and placed in the `weights/` directory.
+* `rfa_unet_best.pth`: Automatically downloaded the first time you run with `--weights_type rfa-unet`. Can also be manually provided via `--weights_path`.
+
+See `weights/README.md` for details.
 
 ---
 
@@ -81,94 +93,95 @@ The model expects data in the following format:
 data/
 ├── images/
 │   ├── image1.jpg
-│   ├── image2.tif
 │   └── ...
 └── masks/
     ├── image1_mask.png
-    ├── image2_mask.png
     └── ...
 ```
 
 * **Images**: RGB OCT images (3 channels)
-* **Masks**: Binary masks (1 channel) representing the choroid
+* **Masks**: Binary masks (1 channel)
 
-> **Note**: Due to privacy concerns, the dataset is not included. Users must provide their own OCT dataset.
+> ⚠️ Due to privacy concerns, the dataset is not included. You must provide your own data in the above format.
 
 ---
 
-## 🧠 Training the Model
+## 🧠 Usage
 
-Prepare your dataset in the `data/` directory as shown above.
+### 🔧 Training the Model
 
-Then run the script with:
+Ensure your dataset is in the correct structure, then run one of the following:
+
+**Train from scratch (random initialization):**
 
 ```bash
-python src/rfa-u-net.py --image_dir path/to/your/data/images \
-                        --mask_dir path/to/your/data/masks \
-                        --weights_path weights/rfa_unet_best.pth
+python src/rfa-u-net.py --image_dir data/images --mask_dir data/masks --weights_type none
 ```
 
-The script will:
-
-* Automatically download weights (if not already present)
-* Train the model for 50 epochs
-* Evaluate on the validation set
-* Visualize the first batch of predictions using `plot_boundaries`
-
----
-
-### 🔧 Available Command-Line Arguments
-
-```
---image_dir       Path to image folder (default: data/images)
---mask_dir        Path to mask folder (default: data/masks)
---weights_path    Path to weights file (default: weights/rfa_unet_best.pth)
---image_size      Input size (default: 224)
---num_epochs      Number of training epochs (default: 50)
---batch_size      Batch size (default: 8)
-```
-
-Example with custom settings:
+**Train from scratch using RETFound weights:**
 
 ```bash
-python src/rfa-u-net.py --image_dir my_data/images \
-                        --mask_dir my_data/masks \
-                        --weights_path weights/rfa_unet_best.pth \
-                        --image_size 256 \
-                        --num_epochs 30 \
-                        --batch_size 4
+python src/rfa-u-net.py --image_dir data/images --mask_dir data/masks --weights_type retfound
+```
+
+**Fine-tune or infer using pre-trained RFA-U-Net (auto-downloads weights):**
+
+```bash
+python src/rfa-u-net.py --image_dir data/images --mask_dir data/masks --weights_type rfa-unet
+```
+
+**Using a custom weights path:**
+
+```bash
+python src/rfa-u-net.py --image_dir data/images --mask_dir data/masks --weights_type rfa-unet --weights_path /path/to/rfa_unet_best.pth
 ```
 
 ---
 
-## 🧪 Inference with Pre-trained Weights
+### 🛠 Command-Line Arguments
 
-To use the pre-trained RFA-U-Net model for inference:
+```
+--image_dir             Path to input images (default: data/images)
+--mask_dir              Path to masks (default: data/masks)
+--weights_type          [none | retfound | rfa-unet] (default: none)
+--weights_path          Custom path to weights (optional)
+--image_size            Input image size (default: 224)
+--num_epochs            Number of training epochs (default: 50)
+--batch_size            Batch size (default: 8)
+--pixel_size_micrometers  Pixel size for error calc (default: 10.35)
+```
 
-1. Ensure `rfa_unet_best.pth` is downloaded to `weights/` (it will download automatically if missing).
-2. Open `examples/visualization.ipynb`.
-3. Update the notebook to load your own image/mask and the weights file.
-4. Run the notebook to see visual results.
+**Example with custom settings:**
+
+```bash
+python src/rfa-u-net.py \
+  --image_dir my_data/images \
+  --mask_dir my_data/masks \
+  --weights_type rfa-unet \
+  --weights_path /custom/path/rfa_unet_best.pth \
+  --image_size 256 \
+  --num_epochs 30 \
+  --batch_size 4 \
+  --pixel_size_micrometers 12.5
+```
 
 ---
 
-## 📊 Visualizing Results
+## 🔍 Inference with Pre-trained Weights
 
-The notebook will generate:
+1. Run the script with `--weights_type rfa-unet` or provide a custom path
+2. Open and run `examples/visualization.ipynb`
+3. Modify the notebook to load your image, mask, and weight file
+4. Visualize:
 
-* ✅ Original image
-* ✅ Ground truth mask
-* ✅ Predicted mask
-* ✅ Boundary overlays:
-
-  * Red = True upper
-  * Green = True lower
-  * Blue = Predicted upper
-  * Yellow = Predicted lower
+* Original image
+* Ground truth mask
+* Predicted mask
+* Boundary overlays (red, green, blue, yellow)
 
 ---
 
-## 📈 Results
+## 📊 Results
 
 * **Test Dice Score**: \~0.95
 * **Boundary Errors**:
@@ -182,44 +195,51 @@ The notebook will generate:
 
 ## 🖼 Example Output
 
-*(Insert your image here if available)*
+*(Insert images here if available)*
+
+---
+
+## 🧪 Notes
+
+* **Mixed Precision Training**: Uses `torch.cuda.amp` for faster GPU training
+* **Numerical Stability**: Uses `GradScaler` to avoid NaNs. Check data integrity and learning rate (`1e-4` default) if you encounter issues.
 
 ---
 
 ## 📄 License
 
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file.
 
 ---
 
 ## 🙏 Acknowledgments
 
-* RETFound weights and Vision Transformer implementation from [RETFound\_MAE](https://github.com/rmaphoh/RETFound_MAE)
+* ViT and RETFound implementation (`models_vit.py`) adapted from [RETFound\_MAE](https://github.com/rmaphoh/RETFound_MAE)
 * Inspired by Vision Transformer and U-Net architectures
 
 ---
 
 ## 📬 Contact
 
-For questions or issues, open an issue on GitHub or contact
+For questions or issues, open an issue on GitHub or email
 📧 **[alirezahayati17@yahoo.com](mailto:alirezahayati17@yahoo.com)**
 
 ---
 
 ## 🤝 Contributors
 
-Thanks to the following contributors:
+Thanks to the following people for their contributions:
 
 * **Alireza Hayati** – Initial development
-* **Roya Arian** – Helped with training experiments
-* **Narges Saedizadeh** – Helped with training experiments
+* **Roya Arian** – Training support
+* **Narges Sa** – Training support
 
 ---
 
-## 📌 Tags / Hashtags
+## 📌 Tags
 
 \#DeepLearning #MedicalImaging #OCT #ChoroidSegmentation #VisionTransformer
-\#UNet #RETFound #ComputerVision #MedicalAI #SemanticSegmentation
-\#PyTorch #AIinHealthcare #ImageSegmentation #BiomedicalImaging
+\#UNet #RETFound #ImageSegmentation #SemanticSegmentation #MedicalAI
+\#PyTorch #BiomedicalImaging #AIinHealthcare #ComputerVision
 
-
+---
