@@ -5,7 +5,6 @@ This script implements a Vision Transformer (ViT) encoder pre-trained with RETFo
 weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 """
 
-
 import os
 import torch
 import torch.nn as nn
@@ -23,6 +22,7 @@ from timm.models.layers import drop_path, to_2tuple, trunc_normal_
 from . import models_vit
 from .util.pos_embed import interpolate_pos_embed
 import argparse
+
 # Command-line argument parser
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
@@ -154,8 +154,7 @@ class AttentionUNetViT(nn.Module):
                     raise FileNotFoundError(f"RETFound weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
                 else:
                     raise FileNotFoundError(f"RFA-U-Net weights file not found: {config['retfound_weights_path']}. Please download rfa_unet_best.pth and place it in the weights/ directory.")
-            checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
-            if args.weights_type == 'retfound':
+            checkpoint = torch.load(config        if args.weights_type == 'retfound':
                 checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
                 state_dict = self.encoder.state_dict()
                 for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
