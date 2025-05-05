@@ -36,7 +36,7 @@ def parse_args():
                         help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224,
                         help='Input image size')
-    parser.add_argument('--num_epochs', type=int, default=20,  # Set to 20 as requested
+    parser.add_argument('--num_epochs', type=int, default=20,
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training')
@@ -265,13 +265,21 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
         return 1 - dice
 
-# Dice Score (Aligned with root code: computes for both classes)
-def dice_score(outputs, targets):
-    outputs = torch.sigmoid(outputs).contiguous().view(-1)
-    targets = targets.contiguous().view(-1)
-    intersection = (outputs * targets).sum()
-    dice = (2. * intersection) / (outputs.sum() + targets.sum())
-    return dice.item()
+# Dice Score (Updated to compute both combined and choroid-specific Dice scores)
+def dice_score(outputs, targets, smooth=1e-6):
+    # Compute combined Dice score (across both classes, matching root code)
+    outputs_combined = torch.sigmoid(outputs).contiguous().view(-1)
+    targets_combined = targets.contiguous().view(-1)
+    intersection_combined = (outputs_combined * targets_combined).sum()
+    dice_combined = (2. * intersection_combined) / (outputs_combined.sum() + targets_combined.sum())
+
+    # Compute choroid-specific Dice score (channel 1)
+    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)
+    targets_choroid = targets[:, 1, :, :].contiguous().view(-1)
+    intersection_choroid = (outputs_choroid * targets_choroid).sum()
+    dice_choroid = (2. * intersection_choroid + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
+
+    return dice_combined.item(), dice_choroid.item()
 
 # Boundary Detection and Error Computation
 def find_boundaries(mask):
@@ -445,23 +453,25 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
         print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader):.4f}")
 
     model.eval()
-    dice_scores, upper_signed_errors, upper_unsigned_errors, lower_signed_errors, lower_unsigned_errors = [], [], [], [], []
+    dice_combined_scores, dice_choroid_scores = [], []
+    upper_signed_errors, upper_unsigned_errors, lower_signed_errors, lower_unsigned_errors = [], [], [], []
     with torch.no_grad():
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            dice = dice_score(outputs, masks)  # Computes Dice for both classes, matching root code
-            dice_scores.append(dice)
+            dice_combined, dice_choroid = dice_score(outputs, masks)  # Compute both Dice scores
+            dice_combined_scores.append(dice_combined)
+            dice_choroid_scores.append(dice_choroid)
             predicted_masks = torch.sigmoid(outputs).cpu().numpy()
             true_masks = masks.cpu().numpy()
             for i in range(images.size(0)):
                 predicted_mask = predicted_masks[i, 1]  # Choroid channel
                 true_mask = true_masks[i, 1]  # Choroid channel
-              #  print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
-               # print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
+                print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
+                print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
                 predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
                 true_mask_binary = (true_mask > 0.5).astype(np.uint8)
-              #  print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
+                print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
                 gt_upper, gt_lower = find_boundaries(true_mask_binary)
                 upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
@@ -470,7 +480,8 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
                 upper_unsigned_errors.append(upper_unsigned)
                 lower_signed_errors.append(lower_signed)
                 lower_unsigned_errors.append(lower_unsigned)
-    avg_dice = np.mean(dice_scores)
+    avg_dice_combined = np.mean(dice_combined_scores)
+    avg_dice_choroid = np.mean(dice_choroid_scores)
     avg_upper_signed_error = np.mean(upper_signed_errors)
     avg_upper_unsigned_error = np.mean(upper_unsigned_errors)
     avg_lower_signed_error = np.mean(lower_signed_errors)
@@ -488,7 +499,7 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             plot_boundaries(images, masks, predicted_masks, threshold)
             break  # Visualize only the first batch
 
-    return avg_dice, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
+    return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
 
 # Main Execution
 if __name__ == "__main__":
@@ -520,8 +531,9 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    dice, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
+    dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
         train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold
     )
-    print(f"Validation Dice: {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
+    print(f"Validation Dice (Combined): {dice_combined:.4f}, Validation Dice (Choroid): {dice_choroid:.4f}, "
+          f"Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
           f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
