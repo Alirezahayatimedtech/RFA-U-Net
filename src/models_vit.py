@@ -4,7 +4,10 @@
 # --------------------------------------------------------
 
 from functools import partial
-
+import torch.nn as nn
+from functools import partial
+import torch.nn.functional as F
+from timm.layers import drop_path, to_2tuple, trunc_normal_
 import timm.models.vision_transformer
 import torch
 import torch.nn as nn
