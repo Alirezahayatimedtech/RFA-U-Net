@@ -411,7 +411,7 @@ val_test_transform = transforms.Compose([
 ])
 
 # Training and Evaluation Functions
-def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs):
+def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler):
     model.train()
     for epoch in range(num_epochs):
         running_loss = 0.0
@@ -476,8 +476,9 @@ if __name__ == "__main__":
         checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded weights from {config['retfound_weights_path']}")
+    scaler = GradScaler()    
     criterion = DiceLoss(smooth=1e-6).to(device)
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.006622586228339055)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
     valid_size = int(0.15 * len(full_dataset))
@@ -489,8 +490,10 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    
     dice, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
-        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs
+        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler
+  )
     )
     print(f"Validation Dice: {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
           f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
