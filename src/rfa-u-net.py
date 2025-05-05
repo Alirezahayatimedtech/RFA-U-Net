@@ -22,7 +22,6 @@ from timm.models.layers import trunc_normal_
 import models_vit
 from util.pos_embed import interpolate_pos_embed
 import argparse
-import gdown
 
 # Command-line argument parser
 def parse_args():
@@ -32,9 +31,9 @@ def parse_args():
     parser.add_argument('--mask_dir', type=str, default='data/masks',
                         help='Path to the directory containing mask images')
     parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
-                        help='Path to the pre-trained weights file (used if weights_type is rfa-unet)')
-    parser.add_argument('--weights_type', type=str, default='rfa-unet', choices=['retfound', 'rfa-unet'],
-                        help='Type of weights to load: "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
+                        help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
+    parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
+                        help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224,
                         help='Input image size')
     parser.add_argument('--num_epochs', type=int, default=50,
@@ -62,23 +61,6 @@ config = {
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
 RFA_UNET_WEIGHTS_PATH = "weights/rfa_unet_best.pth"
 
-# URL for downloading RFA-U-Net weights (replace with actual Google Drive file ID)
-RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=rfa-unet-placeholder-id"
-
-# Function to download weights if not present
-def download_weights(weights_path, url):
-    if not os.path.exists(weights_path):
-        print(f"Weights file not found at {weights_path}. Downloading...")
-        os.makedirs(os.path.dirname(weights_path), exist_ok=True)
-        gdown.download(url, weights_path, quiet=False)
-        print(f"Weights downloaded to {weights_path}")
-    else:
-        print(f"Weights file already exists at {weights_path}")
-
-# Download RFA-U-Net weights if not present
-if args.weights_type == 'rfa-unet':
-    download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
-
 # Determine which weights to load based on weights_type
 if args.weights_type == 'retfound':
     config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
@@ -86,6 +68,8 @@ if args.weights_type == 'retfound':
 elif args.weights_type == 'rfa-unet':
     config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
     print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
+elif args.weights_type == 'none':
+    print("No pre-trained weights specified. Initializing model with random weights.")
 
 # Convolutional block for decoder
 class ConvBlock(nn.Module):
@@ -163,21 +147,34 @@ class AttentionUNetViT(nn.Module):
         )
         # Modify patch embedding for 3-channel input
         self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
-        # Load RETFound weights if specified
-        if config["retfound_weights_path"] == RETFOUND_WEIGHTS_PATH:
+        # Load weights if specified
+        if args.weights_type in ['retfound', 'rfa-unet']:
             if not os.path.exists(config["retfound_weights_path"]):
-                raise FileNotFoundError(f"Weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
+                if args.weights_type == 'retfound':
+                    raise FileNotFoundError(f"RETFound weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
+                else:
+                    raise FileNotFoundError(f"RFA-U-Net weights file not found: {config['retfound_weights_path']}. Please download rfa_unet_best.pth and place it in the weights/ directory.")
             checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
-            checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            state_dict = self.encoder.state_dict()
-            for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
-                if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint")
-                    del checkpoint_model[k]
-            interpolate_pos_embed(self.encoder, checkpoint_model)
-            msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
-            print("Loaded RETFound weights, missing keys:", msg.missing_keys)
-            trunc_normal_(self.encoder.head.weight, std=2e-5)
+            if args.weights_type == 'retfound':
+                checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
+                state_dict = self.encoder.state_dict()
+                for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
+                    if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                        print(f"Removing key {k} from pretrained checkpoint")
+                        del checkpoint_model[k]
+                interpolate_pos_embed(self.encoder, checkpoint_model)
+                msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
+                print("Loaded RETFound weights, missing keys:", msg.missing_keys)
+                trunc_normal_(self.encoder.head.weight, std=2e-5)
+            else:
+                # For RFA-U-Net weights, load the entire model state dict
+                model_state_dict = self.state_dict()
+                for k in ['head.weight', 'head.bias']:
+                    if k in checkpoint and checkpoint[k].shape != model_state_dict[k].shape:
+                        print(f"Removing key {k} from pretrained checkpoint")
+                        del checkpoint[k]
+                msg = self.load_state_dict(checkpoint, strict=False)
+                print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
 
         # Decoder blocks
         self.d1 = DecoderBlock([1024, 1024], 512)
@@ -452,7 +449,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionUNetViT(config).to(device)
     # Load pre-trained weights (either RETFound or RFA-U-Net based on weights_type)
-    if os.path.exists(config["retfound_weights_path"]):
+    if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
         checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded weights from {config['retfound_weights_path']}")
