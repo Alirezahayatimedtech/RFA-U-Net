@@ -1,55 +1,79 @@
 
+---
+
 ## 📦 Pre-trained Weights
 
-The script (`src/rfa-u-net.py`) will automatically download or use the appropriate pre-trained weights based on the `--weights_type` argument.
+Pre-trained weights are **optional**. You can:
 
-### 🎯 Available Weights
+* Train the model **from scratch** using `--weights_type none`
+* Use **pre-trained RETFound weights** for ViT initialization (`--weights_type retfound`)
+* Use **RFA-U-Net pre-trained weights** for fine-tuning or inference (`--weights_type rfa-unet`)
+
+---
+
+### 🔗 Available Weights
 
 * **`RETFound_oct_weights.pth`**
-  Pre-trained RETFound weights used to initialize the Vision Transformer encoder for **training from scratch**.
-  📥 **Manual download required** from the [RETFound\_MAE repository](https://github.com/rmaphoh/RETFound_MAE).
+  Pre-trained RETFound Vision Transformer weights, used to initialize the encoder when training RFA-U-Net from scratch.
+  📥 *Must be downloaded manually* from the [RETFound\_MAE repository](https://github.com/rmaphoh/RETFound_MAE) and placed in the `weights/` directory.
 
 * **`rfa_unet_best.pth`**
-  Best pre-trained weights for RFA-U-Net, trained on an OCT dataset.
-  ✅ Automatically downloaded on first use when running with `--weights_type rfa-unet`.
-  Suitable for **inference** or **fine-tuning**.
+  Best-performing RFA-U-Net model weights trained on an OCT dataset.
+  ✅ Automatically downloaded to the `weights/` directory when `--weights_type rfa-unet` is used (unless a custom path is specified via `--weights_path`).
 
 ---
 
-## 🔍 Weight Details
+### 📁 Weight Details
 
-### `RETFound_oct_weights.pth`
+#### `RETFound_oct_weights.pth`
 
-* **Source**: [RETFound\_MAE GitHub Repository](https://github.com/rmaphoh/RETFound_MAE)
-* **Usage**: Required when using `--weights_type retfound` to train RFA-U-Net from scratch
-* **Setup**: Must be manually downloaded and placed in the `weights/` directory
+* **Source**: [RETFound\_MAE GitHub Repo](https://github.com/rmaphoh/RETFound_MAE)
+* **Usage**: Required when running the script with `--weights_type retfound`
+* **Setup**: Must be manually downloaded and saved in the `weights/` directory
 
-### `rfa_unet_best.pth`
+#### `rfa_unet_best.pth`
 
 * **Source**: Hosted on Google Drive
-* **Usage**: Used when `--weights_type rfa-unet` is specified for inference or continued training
-* **Setup**: Automatically downloaded if not already present (uses `gdown`)
+* **Usage**: Automatically downloaded on first run with `--weights_type rfa-unet`
+* **Setup**: You can override the default location using `--weights_path`.
+  To re-download, delete the existing file and rerun the script.
 
 ---
 
-## 📝 Notes
+### 📝 Notes
 
-* To use **RETFound** weights:
-  You must manually download `RETFound_oct_weights.pth` from the [RETFound\_MAE repository](https://github.com/rmaphoh/RETFound_MAE) and place it in this directory **before** running the script with `--weights_type retfound`.
-
-* To use **RFA-U-Net** pre-trained weights (`rfa_unet_best.pth`):
-  They are **automatically downloaded** if missing when running the script with `--weights_type rfa-unet`.
-
-* To **force re-download** of `rfa_unet_best.pth`:
-  Simply delete the file from the `weights/` directory and rerun the script.
-
-* Ensure the `gdown` package is installed (already included in `requirements.txt`) for automatic downloading.
-
-* When **evaluating boundary errors**, you can specify the pixel size in micrometers using:
+* **To use RETFound weights**, manually place `RETFound_oct_weights.pth` in the `weights/` directory before running:
 
   ```bash
-  --pixel_size_micrometers 10.35  # default is 10.35 μm
+  python src/rfa-u-net.py --image_dir path/to/data/images --mask_dir path/to/data/masks --weights_type retfound
   ```
 
-  Adjust this based on your dataset’s imaging specs.
+* **To use RFA-U-Net weights**, run with:
+
+  ```bash
+  python src/rfa-u-net.py --image_dir path/to/data/images --mask_dir path/to/data/masks --weights_type rfa-unet
+  ```
+
+* **To use a custom path for weights**, specify it explicitly:
+
+  ```bash
+  python src/rfa-u-net.py --image_dir path/to/images --mask_dir path/to/masks --weights_type rfa-unet --weights_path /custom/path/rfa_unet_best.pth
+  ```
+
+* **To train from scratch**, use:
+
+  ```bash
+  python src/rfa-u-net.py --image_dir path/to/images --mask_dir path/to/masks --weights_type none
+  ```
+
+* **Boundary error evaluation**:
+  Pixel size (in micrometers) can be adjusted with:
+
+  ```bash
+  --pixel_size_micrometers 10.35
+  ```
+
+  *(Default is 10.35 μm. Adjust this based on your OCT image resolution.)*
+
+---
 
