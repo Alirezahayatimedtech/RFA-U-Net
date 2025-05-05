@@ -19,9 +19,10 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 from sklearn.metrics import confusion_matrix
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
-import models_vit
-from util.pos_embed import interpolate_pos_embed
+from . import models_vit
+from .util.pos_embed import interpolate_pos_embed
 import argparse
+import gdown
 
 # Command-line argument parser
 def parse_args():
@@ -61,6 +62,23 @@ config = {
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
 RFA_UNET_WEIGHTS_PATH = "weights/rfa_unet_best.pth"
 
+# URL for downloading RFA-U-Net weights
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
+
+# Function to download weights if not present
+def download_weights(weights_path, url):
+    if not os.path.exists(weights_path):
+        print(f"Weights file not found at {weights_path}. Downloading...")
+        os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+        gdown.download(url, weights_path, quiet=False)
+        print(f"Weights downloaded to {weights_path}")
+    else:
+        print(f"Weights file already exists at {weights_path}")
+
+# Download RFA-U-Net weights if not present and weights_type is rfa-unet
+if args.weights_type == 'rfa-unet':
+    download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
+
 # Determine which weights to load based on weights_type
 if args.weights_type == 'retfound':
     config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
@@ -70,6 +88,9 @@ elif args.weights_type == 'rfa-unet':
     print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
 elif args.weights_type == 'none':
     print("No pre-trained weights specified. Initializing model with random weights.")
+
+
+
 
 # Convolutional block for decoder
 class ConvBlock(nn.Module):
