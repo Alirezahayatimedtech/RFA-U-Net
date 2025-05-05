@@ -19,8 +19,8 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 from sklearn.metrics import confusion_matrix
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
-from . import models_vit
-from .util.pos_embed import interpolate_pos_embed
+import models_vit
+from util.pos_embed import interpolate_pos_embed
 import argparse
 
 # Command-line argument parser
