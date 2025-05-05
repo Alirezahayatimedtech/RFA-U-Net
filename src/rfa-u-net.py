@@ -16,7 +16,6 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.model_selection import KFold
 from sklearn.metrics import confusion_matrix
 from timm.layers import drop_path, to_2tuple, trunc_normal_
 import models_vit
@@ -37,14 +36,14 @@ def parse_args():
                         help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224,
                         help='Input image size')
-    parser.add_argument('--num_epochs', type=int, default=20,
+    parser.add_argument('--num_epochs', type=int, default=20,  # Set to 20 as requested
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training')
     parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
                         help='Pixel size in micrometers for boundary error computation')
-    parser.add_argument('--threshold', type=float, default=0.3,
-                        help='Threshold for binarizing predicted masks (default: 0.3)')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Threshold for binarizing predicted masks (default: 0.5)')
     return parser.parse_args()
 
 # Parse arguments
@@ -236,7 +235,7 @@ class AttentionUNetViT(nn.Module):
         output = self.output(x)
         return output
 
-# Tversky Loss
+# Tversky Loss (Aligned with root code)
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
         super().__init__()
@@ -253,7 +252,7 @@ class TverskyLoss(nn.Module):
         tversky = (true_pos + self.smooth) / (true_pos + self.alpha * false_neg + self.beta * false_pos + self.smooth)
         return 1 - tversky
 
-# Dice Loss
+# Dice Loss (Defined but not used, for compatibility with root code)
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
         super().__init__()
@@ -266,15 +265,12 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
         return 1 - dice
 
-# Dice Score (Updated to compute only for choroid layer)
-def dice_score(outputs, targets, smooth=1e-6):
-    # Select the choroid channel (index 1)
-    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)  # Shape: (batch_size * H * W,)
-    targets_choroid = targets[:, 1, :, :].contiguous().view(-1)  # Shape: (batch_size * H * W,)
-    
-    # Compute intersection and sums for Dice score
-    intersection = (outputs_choroid * targets_choroid).sum()
-    dice = (2. * intersection + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
+# Dice Score (Aligned with root code: computes for both classes)
+def dice_score(outputs, targets):
+    outputs = torch.sigmoid(outputs).contiguous().view(-1)
+    targets = targets.contiguous().view(-1)
+    intersection = (outputs * targets).sum()
+    dice = (2. * intersection) / (outputs.sum() + targets.sum())
     return dice.item()
 
 # Boundary Detection and Error Computation
@@ -454,18 +450,18 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            dice = dice_score(outputs, masks)  # Computes Dice for choroid layer only
+            dice = dice_score(outputs, masks)  # Computes Dice for both classes, matching root code
             dice_scores.append(dice)
             predicted_masks = torch.sigmoid(outputs).cpu().numpy()
             true_masks = masks.cpu().numpy()
             for i in range(images.size(0)):
                 predicted_mask = predicted_masks[i, 1]  # Choroid channel
                 true_mask = true_masks[i, 1]  # Choroid channel
-                print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
-                print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
+              #  print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
+               # print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
                 predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
                 true_mask_binary = (true_mask > 0.5).astype(np.uint8)
-                print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
+              #  print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
                 gt_upper, gt_lower = find_boundaries(true_mask_binary)
                 upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
@@ -510,8 +506,8 @@ if __name__ == "__main__":
         checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded weights from {config['retfound_weights_path']}")
-    criterion = DiceLoss(smooth=1e-6).to(device)
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)  # Lowered learning rate
+    criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)  # Aligned with root code
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)  # Set to 1e-4 as requested
     scaler = GradScaler('cuda')  # Initialize GradScaler for mixed precision
     full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
@@ -527,5 +523,5 @@ if __name__ == "__main__":
     dice, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
         train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold
     )
-    print(f"Validation Dice (Choroid Layer): {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
+    print(f"Validation Dice: {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
           f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
