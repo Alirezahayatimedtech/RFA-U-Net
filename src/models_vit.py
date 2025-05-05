@@ -3,17 +3,12 @@
 # Partly revised by YZ @UCL&Moorfields
 # --------------------------------------------------------
 
-from functools import partial
-import torch.nn as nn
-from functools import partial
-import torch.nn.functional as F
-from timm.layers import drop_path, to_2tuple, trunc_normal_
-import timm.models.vision_transformer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-
+from functools import partial
+from timm.layers import drop_path, to_2tuple, trunc_normal_
+import timm.models.vision_transformer
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     """ Vision Transformer with support for global average pooling
@@ -42,7 +37,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             x = blk(x)
 
         if self.global_pool:
-            x = x[:, 1:, :].mean(dim=1,keepdim=True)  # global pool without cls token
+            x = x[:, 1:, :].mean(dim=1, keepdim=True)  # global pool without cls token
             outcome = self.fc_norm(x)
         else:
             x = self.norm(x)
@@ -50,14 +45,11 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return outcome
 
-
 def RETFound_mae(**kwargs):
     model = VisionTransformer(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
-
-
 
 def RETFound_dinov2(args, **kwargs):
     model = timm.create_model(
@@ -67,5 +59,3 @@ def RETFound_dinov2(args, **kwargs):
         **kwargs
     )
     return model
-
-
