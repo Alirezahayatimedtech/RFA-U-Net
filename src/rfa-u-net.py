@@ -55,7 +55,7 @@ config = {
     "patch_size": 16,
     "num_channels": 3,
     "num_classes": 2,
-    "retfound_weights_path": args.weights_path  # Updated to use weights_path argument
+    "retfound_weights_path": args.weights_path
 }
 
 # Weights file paths
@@ -80,7 +80,6 @@ if args.weights_type == 'retfound':
     config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
     print("Using RETFound weights for training from scratch")
 elif args.weights_type == 'rfa-unet':
-    # Use the user-provided weights_path if it exists, otherwise fall back to default and auto-download
     if os.path.exists(args.weights_path):
         config["retfound_weights_path"] = args.weights_path
         print(f"Using pre-trained RFA-U-Net weights from user-provided path: {args.weights_path}")
@@ -265,12 +264,15 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
         return 1 - dice
 
-# Dice Score
-def dice_score(outputs, targets):
-    outputs = torch.sigmoid(outputs).contiguous().view(-1)
-    targets = targets.contiguous().view(-1)
-    intersection = (outputs * targets).sum()
-    dice = (2. * intersection) / (outputs.sum() + targets.sum())
+# Dice Score (Updated to compute only for choroid layer)
+def dice_score(outputs, targets, smooth=1e-6):
+    # Select the choroid channel (index 1)
+    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)  # Shape: (batch_size * H * W,)
+    targets_choroid = targets[:, 1, :, :].contiguous().view(-1)  # Shape: (batch_size * H * W,)
+    
+    # Compute intersection and sums for Dice score
+    intersection = (outputs_choroid * targets_choroid).sum()
+    dice = (2. * intersection + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
     return dice.item()
 
 # Boundary Detection and Error Computation
@@ -449,7 +451,7 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            dice = dice_score(outputs, masks)
+            dice = dice_score(outputs, masks)  # Now computes Dice for choroid layer only
             dice_scores.append(dice)
             predicted_masks = torch.sigmoid(outputs).cpu().numpy()
             true_masks = masks.cpu().numpy()
@@ -516,11 +518,11 @@ if __name__ == "__main__":
     train_dataset.dataset.transform = train_transform
     valid_dataset.dataset.transform = val_test_transform
     test_dataset.dataset.transform = val_test_transform
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)  # Reduced num_workers
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     dice, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
         train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler
     )
-    print(f"Validation Dice: {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
+    print(f"Validation Dice (Choroid Layer): {dice:.4f}, Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
           f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
