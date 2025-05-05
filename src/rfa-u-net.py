@@ -8,9 +8,11 @@ weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 import os
 import torch
 import torch.nn as nn
+
+
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
@@ -293,7 +295,11 @@ def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
         unsigned_error = abs(signed_error)
         signed_errors.append(signed_error)
         unsigned_errors.append(unsigned_error)
+    if not signed_errors:  # If no valid boundary pairs, return 0.0
+        print("Warning: No valid boundary pairs found for error computation. Returning 0.0.")
+        return 0.0, 0.0
     return np.mean(signed_errors), np.mean(unsigned_errors)
+
 
 # Visualization Function
 def plot_boundaries(images, true_masks, predicted_masks):
@@ -418,7 +424,7 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
         for images, masks in train_loader:
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
-            with autocast():
+            with autocast('cuda'):
                 outputs = model(images)
                 loss = criterion(outputs, masks)
             loss.backward()
@@ -478,7 +484,7 @@ if __name__ == "__main__":
         print(f"Loaded weights from {config['retfound_weights_path']}")
     criterion = DiceLoss(smooth=1e-6).to(device)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    scaler = GradScaler()  # Initialize GradScaler for mixed precision
+    scaler = GradScaler('cuda')  # Initialize GradScaler for mixed precision 
     full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
     valid_size = int(0.15 * len(full_dataset))
