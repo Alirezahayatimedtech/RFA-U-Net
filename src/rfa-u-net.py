@@ -75,20 +75,22 @@ def download_weights(weights_path, url):
     else:
         print(f"Weights file already exists at {weights_path}")
 
-# Download RFA-U-Net weights if not present and weights_type is rfa-unet
-if args.weights_type == 'rfa-unet':
-    download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
-
 # Determine which weights to load based on weights_type
 if args.weights_type == 'retfound':
     config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
     print("Using RETFound weights for training from scratch")
 elif args.weights_type == 'rfa-unet':
-    config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
-    print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
+    # Use the user-provided weights_path if it exists, otherwise fall back to default and auto-download
+    if os.path.exists(args.weights_path):
+        config["retfound_weights_path"] = args.weights_path
+        print(f"Using pre-trained RFA-U-Net weights from user-provided path: {args.weights_path}")
+    else:
+        config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
+        download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
+        print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
 elif args.weights_type == 'none':
     print("No pre-trained weights specified. Initializing model with random weights.")
-
+    
 
 
 
