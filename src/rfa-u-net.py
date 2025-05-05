@@ -467,11 +467,11 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             for i in range(images.size(0)):
                 predicted_mask = predicted_masks[i, 1]  # Choroid channel
                 true_mask = true_masks[i, 1]  # Choroid channel
-                print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
-                print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
+               # print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
+               # print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
                 predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
                 true_mask_binary = (true_mask > 0.5).astype(np.uint8)
-                print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
+                #print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
                 gt_upper, gt_lower = find_boundaries(true_mask_binary)
                 upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
