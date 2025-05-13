@@ -40,6 +40,14 @@ def parse_args():
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training')
+                            help='Batch size for training')
+
+    parser.add_argument('--test_only', action='store_true',
+                        help='Run inference on external data without training')
+    parser.add_argument('--test_image_dir', type=str, default=None,
+                        help='Path to external test images (only used if --test_only)')
+    parser.add_argument('--test_mask_dir',  type=str, default=None,
+                        help='Path to external test masks (only used if --test_only)')
     parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
                         help='Pixel size in micrometers for boundary error computation')
     parser.add_argument('--threshold', type=float, default=0.5,
