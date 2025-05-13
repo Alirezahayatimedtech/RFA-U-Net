@@ -22,6 +22,7 @@ import models_vit
 from util.pos_embed import interpolate_pos_embed
 import argparse
 import gdown
+import sys
 
 # Command-line argument parser
 def parse_args():
@@ -40,18 +41,17 @@ def parse_args():
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training')
-                            help='Batch size for training')
-
+    # External-data testing flags (added)
     parser.add_argument('--test_only', action='store_true',
                         help='Run inference on external data without training')
     parser.add_argument('--test_image_dir', type=str, default=None,
-                        help='Path to external test images (only used if --test_only)')
-    parser.add_argument('--test_mask_dir',  type=str, default=None,
-                        help='Path to external test masks (only used if --test_only)')
+                        help='Path to external test images (used if --test_only)')
+    parser.add_argument('--test_mask_dir', type=str, default=None,
+                        help='Path to external test masks (used if --test_only)')
     parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
                         help='Pixel size in micrometers for boundary error computation')
     parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Threshold for binarizing predicted masks (default: 0.5)')
+                        help='Threshold for binarizing predicted masks')
     return parser.parse_args()
 
 # Parse arguments
@@ -509,8 +509,63 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
 
     return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
 
-# Main Execution
-if __name__ == "__main__":
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Instantiate model and freeze encoder layers
+    model = AttentionUNetViT(config).to(device)
+    for i, blk in enumerate(model.encoder.blocks):
+        if i < 23:
+            for p in blk.parameters(): p.requires_grad = False
+
+    if args.test_only:
+        # Verify test dirs provided
+        assert args.test_image_dir and args.test_mask_dir, (
+            '--test_only requires --test_image_dir and --test_mask_dir'
+        )
+        # Build dataset & loader
+        test_ds = OCTDataset(
+            args.test_image_dir, args.test_mask_dir,
+            transform=val_test_transform, num_classes=2
+        )
+        test_loader = DataLoader(
+            test_ds, batch_size=args.batch_size,
+            shuffle=False, num_workers=2, pin_memory=True
+        )
+        # Load pretrained weights
+        cp = torch.load(config['retfound_weights_path'], map_location=device)
+        model.load_state_dict(cp, strict=False)
+        model.eval()
+        # Inference & metrics
+        all_dice, all_upper, all_lower = [], [], []
+        with torch.no_grad():
+            for imgs, msks in test_loader:
+                imgs, msks = imgs.to(device), msks.to(device)
+                outs = model(imgs)
+                _, dch = dice_score(outs, msks)
+                all_dice.append(dch)
+                preds = torch.sigmoid(outs).cpu().numpy()
+                gts = msks.cpu().numpy()
+                for i in range(imgs.size(0)):
+                    pm = (preds[i,1] > args.threshold).astype(np.uint8)
+                    tm = (gts[i,1] > 0.5).astype(np.uint8)
+                    pu, pl = find_boundaries(pm)
+                    gu, gl = find_boundaries(tm)
+                    us, uu = compute_errors(pu, gu, args.pixel_size_micrometers)
+                    ls, lu = compute_errors(pl, gl, args.pixel_size_micrometers)
+                    all_upper.append((us, uu))
+                    all_lower.append((ls, lu))
+        # Print summary
+        print(f"Choroid Dice on external data: {np.mean(all_dice):.4f}")
+        usm = np.mean([u for u,_ in all_upper])
+        uum = np.mean([u for _,u in all_upper])
+        lsm = np.mean([l for l,_ in all_lower])
+        lum = np.mean([l for _,l in all_lower])
+        print(f"Upper signed/unsigned error: {usm:.2f}/{uum:.2f} μm")
+        print(f"Lower signed/unsigned error: {lsm:.2f}/{lum:.2f} μm")
+        sys.exit(0)
+
+
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionUNetViT(config).to(device)
     # Freeze encoder layers to focus training on the decoder
@@ -520,6 +575,49 @@ if __name__ == "__main__":
         if i < frozen_layers:
             for param in layer.parameters():
                 param.requires_grad = False
+    if args.test_only:
+    # 1. Verify test dirs provided
+    assert args.test_image_dir and args.test_mask_dir, "--test_only requires --test_image_dir and --test_mask_dir"
+    # 2. Build dataset and loader
+    test_dataset = OCTDataset(args.test_image_dir, args.test_mask_dir,
+                              transform=val_test_transform, num_classes=2)
+    test_loader  = DataLoader(test_dataset, batch_size=args.batch_size,
+                              shuffle=False, num_workers=2, pin_memory=True)
+    # 3. Instantiate and load model + weights
+    model = AttentionUNetViT(config).to(device)
+    checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
+    model.load_state_dict(checkpoint, strict=False)
+    model.eval()
+    # 4. Run inference & compute metrics
+    all_dice, all_upper_err, all_lower_err = [], [], []
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            dice_c, dice_ch = dice_score(outputs, masks)
+            all_dice.append(dice_ch)  # or combined as you prefer
+            # boundary errors per batch
+            pred_np = torch.sigmoid(outputs).cpu().numpy()
+            true_np = masks.cpu().numpy()
+            for i in range(images.size(0)):
+                pred_mask = (pred_np[i,1] > args.threshold).astype(np.uint8)
+                true_mask = (true_np[i,1] > 0.5).astype(np.uint8)
+                pu, pl = find_boundaries(pred_mask)
+                gu, gl = find_boundaries(true_mask)
+                ue_signed, ue_unsigned = compute_errors(pu, gu, args.pixel_size_micrometers)
+                le_signed, le_unsigned = compute_errors(pl, gl, args.pixel_size_micrometers)
+                all_upper_err.append((ue_signed, ue_unsigned))
+                all_lower_err.append((le_signed, le_unsigned))
+    # 5. Aggregate & print
+    print(f"Choroid Dice on external data: {np.mean(all_dice):.4f}")
+    ups = np.mean([u for u,_ in all_upper_err])
+    upu = np.mean([u for _,u in all_upper_err])
+    lws = np.mean([l for l,_ in all_lower_err])
+    lwu = np.mean([l for _,l in all_lower_err])
+    print(f"Upper signed / unsigned error: {ups:.2f} / {upu:.2f} μm")
+    print(f"Lower signed / unsigned error: {lws:.2f} / {lwu:.2f} μm")
+    exit(0)
+            
     # Load pre-trained weights (either RETFound or RFA-U-Net based on weights_type)
     if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
         checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
