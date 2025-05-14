@@ -8,7 +8,7 @@ weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 import os
 import sys
 import argparse
-gdown
+import gdown
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
