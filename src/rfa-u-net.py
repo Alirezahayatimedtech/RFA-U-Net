@@ -376,55 +376,60 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         plt.show()
 
 class OCTDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
+    def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2):
         self.image_dir   = image_dir
         self.mask_dir    = mask_dir
-        self.transform   = transform
+        self.image_size  = image_size
+        self.transform   = transform      # only for images
         self.num_classes = num_classes
-        self.images      = [img for img in os.listdir(image_dir)
-                            if img.endswith(('.jpg', '.JPG', '.tif'))][:1000]
+
+        # only keep .jpg/.JPG files
+        self.images = [
+            fname for fname in os.listdir(self.image_dir)
+            if fname.lower().endswith('.jpg')
+        ]
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         img_name  = self.images[idx]
-        mask_name = img_name.rsplit('.', 1)[0] + '.tif'
+        base, _   = os.path.splitext(img_name)
+        mask_name = base + '.tif'                      # same base name, .tif extension
+
+        # load
         img_path  = os.path.join(self.image_dir, img_name)
         mask_path = os.path.join(self.mask_dir,  mask_name)
+        image     = Image.open(img_path).convert('RGB')
+        mask_pil  = Image.open(mask_path)
 
-        # --- load image & mask as before ---
-        image = Image.open(img_path).convert('RGB')
-        mask_pil = Image.open(mask_path)
-        mask_np  = np.array(mask_pil)
-        if mask_np.ndim == 3:  # RGB → use first channel
-            mask_np = mask_np[..., 0]
-        # map your label values
+        # map any unwanted labels → {0,1}
+        mask_np = np.array(mask_pil)
+        if mask_np.ndim == 3:                        
+            mask_np = mask_np[..., 0]                # drop channels
         mask_np = np.where(mask_np == 3,   0, mask_np)
         mask_np = np.where(mask_np == 249, 1, mask_np)
         mask_np = mask_np.astype(np.uint8)
 
-        # --- apply ONLY to image ---
+        # apply only to image
         if self.transform:
             image = self.transform(image)
-        # (no self.transform(mask)!)
 
-        # --- resize mask with nearest-neighbor ---
+        # resize mask _after_ mapping, with nearest-neighbor
         mask_pil = Image.fromarray(mask_np)
-        mask_pil = mask_pil.resize((args.image_size, args.image_size),
-                                    resample=Image.NEAREST)
-        mask_np  = np.array(mask_pil)   # still 0 or 1
+        mask_pil = mask_pil.resize(
+            (self.image_size, self.image_size),
+            resample=Image.NEAREST
+        )
+        mask_np = np.array(mask_pil)                # still 0 or 1
 
-        # --- convert mask_np → one-hot tensor ---
-        mask_tensor = torch.from_numpy(mask_np).long()              # (H, W)
-        mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes) \
-                         .permute(2, 0, 1).float()               # (2, H, W)
-
-        # debug
-        print(f"Image: {img_name}, Mask after resize unique: {np.unique(mask_np)}")
-        print(f"Final mask tensor shape: {mask_onehot.shape}, unique: {torch.unique(mask_onehot)}")
+        # to one-hot tensor
+        mask_tensor = torch.from_numpy(mask_np).long()                      # (H, W)
+        mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes)  # (H, W, C)
+        mask_onehot = mask_onehot.permute(2, 0, 1).float()                  # (C, H, W)
 
         return image, mask_onehot
+
 
 # Data Transforms
 train_transform = transforms.Compose([
