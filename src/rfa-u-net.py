@@ -375,7 +375,6 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         plt.axis('off')
         plt.show()
 
-# Dataset Class
 class OCTDataset(Dataset):
     def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
         self.image_dir = image_dir
@@ -390,15 +389,30 @@ class OCTDataset(Dataset):
 
     def __getitem__(self, idx):
         img_name = self.images[idx]
-        # Use the same base name for the mask but with .tif extension
         mask_name = img_name.rsplit('.', 1)[0] + '.tif'
         img_path = os.path.join(self.image_dir, img_name)
         mask_path = os.path.join(self.mask_dir, mask_name)
         image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')
+        mask = Image.open(mask_path)
+        
+        # Convert RGB mask to single-channel
+        mask_np = np.array(mask)
+        if len(mask_np.shape) == 3:  # RGB or multi-channel
+            mask_np = mask_np[:, :, 0]  # Use first channel
+        # Map [3, 249] to [0, 1]
+        mask_np = np.where(mask_np == 3, 0, mask_np)  # Map 3 to 0
+        mask_np = np.where(mask_np == 249, 1, mask_np)  # Map 249 to 1
+        mask_np = mask_np.astype(np.uint8)
+        mask = Image.fromarray(mask_np).convert('L')
+        
+        # Debugging prints
+        print(f"Image: {img_name}, Mask: {mask_name}")
+        print(f"Mask unique values (after mapping): {np.unique(mask_np)}")
+        
         if self.transform:
             image = self.transform(image)
             mask = self.transform(mask)
+        
         mask = torch.from_numpy(np.array(mask)).long()
         if mask.dim() == 3 and mask.shape[0] == 1:
             mask = mask.squeeze(0)
@@ -406,6 +420,9 @@ class OCTDataset(Dataset):
             mask = torch.nn.functional.one_hot(mask, num_classes=self.num_classes).permute(2, 0, 1).float()
         else:
             raise ValueError(f"Unexpected mask shape: {mask.shape}")
+        
+        # Debug final mask tensor
+        print(f"Final mask tensor shape: {mask.shape}, Unique values: {torch.unique(mask).tolist()}")
         return image, mask
 
 # Data Transforms
