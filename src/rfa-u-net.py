@@ -376,12 +376,20 @@ if __name__=='__main__':
         ckpt=torch.load(wpath,map_location=device)
         model.load_state_dict(ckpt,strict=False)
     if args.test_only:
-        assert args.test_image_dir and args.test_mask_dir
-        test_ds=OCTDataset(args.test_image_dir,args.test_mask_dir,
-                           image_transform=val_transform,
-                           mask_size=(args.image_size,args.image_size))
-        test_loader=DataLoader(test_ds,batch_size=args.batch_size,
-                                shuffle=False,num_workers=2,pin_memory=True)
+        assert args.test_image_dir and args.test_mask_dir, "--test_only requires --test_image_dir and --test_mask_dir"
+        test_ds = OCTDataset(
+            args.test_image_dir,
+            args.test_mask_dir,
+            transform=val_test_transform,
+            num_classes=2
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True
+        )
         all_d=[]; ue=[]; le=[]
         with torch.no_grad():
             for imgs,msks in test_loader:
