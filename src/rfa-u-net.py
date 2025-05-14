@@ -23,6 +23,8 @@ from util.pos_embed import interpolate_pos_embed
 import argparse
 import gdown
 import sys
+import torch.nn.functional as F
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
