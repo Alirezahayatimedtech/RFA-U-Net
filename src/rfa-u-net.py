@@ -89,7 +89,7 @@ class OCTDataset(Dataset):
         img_name = self.images[idx]
         img_path = os.path.join(self.image_dir, img_name)
         base_name = os.path.splitext(img_name)[0]
-        mask_name = base_name + '.png'
+        mask_name = base_name + '.tif'
         mask_path = os.path.join(self.mask_dir, mask_name)
 
         image = Image.open(img_path).convert('RGB')
