@@ -546,11 +546,13 @@ if __name__ == '__main__':
                 print(f"Output shape: {outs.shape}, Min: {outs.min().item()}, Max: {outs.max().item()}")
                 print(f"Sigmoid output min/max: {torch.sigmoid(outs).min().item()}/{torch.sigmoid(outs).max().item()}")
                 _, dch = dice_score(outs, msks)
+
                 all_dice.append(dch)
-                preds = torch.sigmoid(outs).cpu().numpy()
+                probs = F.softmax(outs, dim=1)
+                hard  = probs.argmax(dim=1).cpu().numpy() # shape [B,H,W], values 0 or 1
                 gts = msks.cpu().numpy()
                 for i in range(imgs.size(0)):
-                    pm = (preds[i,1] > args.threshold).astype(np.uint8)
+                    pm = hard[i]                          # 0/1 mask directly
                     tm = (gts[i,1] > 0.5).astype(np.uint8)
                     pu, pl = find_boundaries(pm)
                     gu, gl = find_boundaries(tm)
