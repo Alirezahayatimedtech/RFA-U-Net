@@ -87,31 +87,46 @@ def preprocess_mask(mask_pil: Image.Image, size: tuple, num_classes: int) -> tor
 
 
 class OCTDataset(Dataset):
-    def __init__(self, image_dir, mask_dir,
-                 image_transform=None, mask_size=(224,224), num_classes=2):
+    def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
-        self.image_transform = image_transform
-        self.mask_size = mask_size
+        self.transform = transform
         self.num_classes = num_classes
+        # List all image files
         self.images = [f for f in os.listdir(image_dir)
-                       if f.lower().endswith(('.jpg','.tif','.png'))]
+                       if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.bmp'))]
+        self.images = sorted(self.images)
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         img_name = self.images[idx]
-        base, _ = os.path.splitext(img_name)
-        mask_name = f"{base}_mask.png"
-        image = Image.open(os.path.join(self.image_dir,img_name)).convert('RGB')
-        mask  = Image.open(os.path.join(self.mask_dir,mask_name)).convert('L')
-        if self.image_transform:
-            image = self.image_transform(image)
-        mask = preprocess_mask(mask, self.mask_size, self.num_classes)
+        img_path = os.path.join(self.image_dir, img_name)
+        # Derive mask name from image base name, but with .png extension
+        base_name = os.path.splitext(img_name)[0]
+        mask_name = base_name + '.png'
+        mask_path = os.path.join(self.mask_dir, mask_name)
+
+        # Load
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path).convert('L')
+
+        # Apply transforms
+        if self.transform:
+            image = self.transform(image)
+            mask = self.transform(mask)
+
+        # Convert mask to one-hot
+        mask = torch.from_numpy(np.array(mask)).long()
+        if mask.dim() == 3 and mask.shape[0] == 1:
+            mask = mask.squeeze(0)
+        if mask.dim() == 2:
+            mask = F.one_hot(mask, num_classes=self.num_classes).permute(2,0,1).float()
+        else:
+            raise ValueError(f"Unexpected mask shape: {mask.shape}")
+
         return image, mask
-
-
 class ConvBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
