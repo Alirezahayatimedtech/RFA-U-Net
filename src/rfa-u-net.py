@@ -27,26 +27,26 @@ from util.pos_embed import interpolate_pos_embed
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
-    parser.add_argument('--image_dir', type=str, help='Path to the directory containing OCT images')
-    parser.add_argument('--mask_dir', type=str, help='Path to the directory containing mask images')
+    parser.add_argument('--image_dir', type=str, required=False, help='Path to the directory containing OCT images (required for training)')
+    parser.add_argument('--mask_dir', type=str, required=False, help='Path to the directory containing mask images (required for training)')
     parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
-                        help='Path to the pre-trained weights file')
+                        help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
     parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
-                        help='Type of weights to load')
+                        help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224, help='Input image size')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--test_only', action='store_true', help='Run inference on external data without training')
-    parser.add_argument('--test_image_dir', type=str, help='Path to external test images')
-    parser.add_argument('--test_mask_dir', type=str, help='Path to external test masks')
-    parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
-                        help='Pixel size in micrometers for boundary error computation')
+    parser.add_argument('--test_image_dir', type=str, default=None, help='Path to external test images (required if --test_only)')
+    parser.add_argument('--test_mask_dir', type=str, default=None, help='Path to external test masks (required if --test_only)')
+    parser.add_argument('--pixel_size_micrometers', type=float, default=10.35, help='Pixel size in micrometers for boundary error computation')
     parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binarizing predicted masks')
     return parser.parse_args()
 
-# Parse arguments\args = parse_args()
+# Parse arguments
+args = parse_args()
 
-# Configuration
+# Configuration based on command-line arguments
 config = {
     "image_size": args.image_size,
     "hidden_dim": 1024,
@@ -56,10 +56,14 @@ config = {
     "retfound_weights_path": args.weights_path
 }
 
+# Weights file paths
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
 RFA_UNET_WEIGHTS_PATH = "weights/rfa_unet_best.pth"
+
+# URL for downloading RFA-U-Net weights
 RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
 
+# Function to download weights if not present
 def download_weights(weights_path, url):
     if not os.path.exists(weights_path):
         print(f"Weights file not found at {weights_path}. Downloading...")
@@ -69,17 +73,22 @@ def download_weights(weights_path, url):
     else:
         print(f"Weights file already exists at {weights_path}")
 
-# Determine weights type
+# Determine which weights to load based on weights_type
 if args.weights_type == 'retfound':
     config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
+    print("Using RETFound weights for training from scratch")
 elif args.weights_type == 'rfa-unet':
     if os.path.exists(args.weights_path):
         config["retfound_weights_path"] = args.weights_path
+        print(f"Using pre-trained RFA-U-Net weights from user-provided path: {args.weights_path}")
     else:
         config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
         download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
+        print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
+elif args.weights_type == 'none':
+    print("No pre-trained weights specified. Initializing model with random weights.")
 
-
+# Convolutional block for decoder
 class ConvBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -91,26 +100,28 @@ class ConvBlock(nn.Module):
             nn.BatchNorm2d(out_c),
             nn.ReLU(inplace=True)
         )
+
     def forward(self, x):
         return self.conv(x)
 
-
+# Attention gate for skip connections
 class AttentionGate(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         self.Wg = nn.Sequential(
-            nn.Conv2d(in_c[0], out_c, kernel_size=1),
+            nn.Conv2d(in_c[0], out_c, kernel_size=1, padding=0),
             nn.BatchNorm2d(out_c)
         )
         self.Ws = nn.Sequential(
-            nn.Conv2d(in_c[1], out_c, kernel_size=1),
+            nn.Conv2d(in_c[1], out_c, kernel_size=1, padding=0),
             nn.BatchNorm2d(out_c)
         )
         self.relu = nn.ReLU(inplace=True)
         self.output = nn.Sequential(
-            nn.Conv2d(out_c, out_c, kernel_size=1),
+            nn.Conv2d(out_c, out_c, kernel_size=1, padding=0),
             nn.Sigmoid()
         )
+
     def forward(self, g, s):
         Wg = self.Wg(g)
         Ws = self.Ws(s)
@@ -122,7 +133,7 @@ class AttentionGate(nn.Module):
             s = F.interpolate(s, size=out.shape[-2:], mode='bilinear', align_corners=True)
         return out * s
 
-
+# Decoder block with attention
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, reduce_skip=True):
         super().__init__()
@@ -130,92 +141,123 @@ class DecoderBlock(nn.Module):
         self.reduce_channels_x = nn.Conv2d(in_c[0], out_c, kernel_size=1)
         self.reduce_channels_s = nn.Conv2d(in_c[1], out_c, kernel_size=1) if reduce_skip else nn.Identity()
         self.ag = AttentionGate([out_c, out_c], out_c)
-        self.c1 = ConvBlock(out_c*2, out_c)
+        self.c1 = ConvBlock(out_c + out_c, out_c)
+
     def forward(self, x, s):
         x = self.up(x)
         x = self.reduce_channels_x(x)
         s = self.reduce_channels_s(s)
         s = self.ag(x, s)
-        x = torch.cat([x, s], dim=1)
+        x = torch.cat([x, s], axis=1)
         x = self.c1(x)
         return x
 
-
+# Main RFA-U-Net model
 class AttentionUNetViT(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # Initialize RETFound-based ViT encoder
         self.encoder = models_vit.RETFound_mae(
-            num_classes=config["num_classes"], drop_path_rate=0.2, global_pool=True)
-        self.encoder.patch_embed.proj = nn.Conv2d(3, config["hidden_dim"], kernel_size=(16,16), stride=(16,16))
-        if args.weights_type in ['retfound','rfa-unet']:
+            num_classes=config["num_classes"],
+            drop_path_rate=0.2,
+            global_pool=True,
+        )
+        # Modify patch embedding for 3-channel input
+        self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
+        # Load weights if specified
+        if args.weights_type in ['retfound', 'rfa-unet']:
             if not os.path.exists(config["retfound_weights_path"]):
-                raise FileNotFoundError(f"Weights not found: {config['retfound_weights_path']}")
+                raise FileNotFoundError(f"Weights file not found: {config['retfound_weights_path']}")
             checkpoint = torch.load(config["retfound_weights_path"], map_location='cpu')
-            # ... loading logic ...
-        self.d1 = DecoderBlock([config["hidden_dim"], config["hidden_dim"]], 512)
-        self.d2 = DecoderBlock([512, config["hidden_dim"]], 256)
-        self.d3 = DecoderBlock([256, config["hidden_dim"]], 128)
-        self.d4 = DecoderBlock([128, config["hidden_dim"]], 64)
-        self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1)
+            checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
+            if args.weights_type == 'retfound':
+                checkpoint_model = checkpoint.get('model', checkpoint)
+                state_dict = self.encoder.state_dict()
+                for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
+                    if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                        del checkpoint_model[k]
+                interpolate_pos_embed(self.encoder, checkpoint_model)
+                msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
+                trunc_normal_(self.encoder.head.weight, std=2e-5)
+                print("Loaded RETFound weights, missing keys:", msg.missing_keys)
+            else:
+                model_state_dict = self.state_dict()
+                for k in ['head.weight', 'head.bias']:
+                    if k in checkpoint and checkpoint[k].shape != model_state_dict[k].shape:
+                        del checkpoint[k]
+                msg = self.load_state_dict(checkpoint, strict=False)
+                print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
+
+        self.d1 = DecoderBlock([1024, 1024], 512)
+        self.d2 = DecoderBlock([512, 1024], 256)
+        self.d3 = DecoderBlock([256, 1024], 128)
+        self.d4 = DecoderBlock([128, 1024], 64)
+        self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1, padding=0)
 
     def forward(self, x):
         x = self.encoder.patch_embed(x)
         batch_size, num_patches, embed_dim = x.shape
-        pos_embed = self.encoder.pos_embed[:,1:,:]
+        pos_embed = self.encoder.pos_embed[:, 1:, :]
         if num_patches != pos_embed.shape[1]:
             pos_embed = interpolate_pos_embed(self.encoder, {'pos_embed': pos_embed})
         x = x + pos_embed
         x = self.encoder.pos_drop(x)
-        skips = []
+        skip_connections = []
         for i, blk in enumerate(self.encoder.blocks):
             x = blk(x)
-            if i in [5,11,17,23]:
-                skips.append(x)
-        z6, z12, z18, z24 = skips
-        def to_feature(tensor):
-            b, n, e = tensor.shape
-            return tensor.transpose(1,2).reshape(b, e, int(e**0.5), int(e**0.5))
-        z6, z12, z18, z24 = map(to_feature, [z6, z12, z18, z24])
+            if i in [5, 11, 17, 23]:
+                skip_connections.append(x)
+        z6, z12, z18, z24 = skip_connections
+        z6 = z6.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
+        z12 = z12.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
+        z18 = z18.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
+        z24 = z24.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
         x = self.d1(z24, z18)
         x = self.d2(x, z12)
         x = self.d3(x, z6)
         x = self.d4(x, z6)
         return self.output(x)
 
-
+# Tversky Loss
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
         super().__init__()
-        self.alpha, self.beta, self.smooth = alpha, beta, smooth
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+
     def forward(self, outputs, targets):
-        outputs = torch.sigmoid(outputs).view(-1)
-        targets = targets.view(-1)
-        tp = (outputs * targets).sum()
-        fn = ((1-outputs)*targets).sum()
-        fp = (outputs*(1-targets)).sum()
-        tversky = (tp+self.smooth)/(tp+self.alpha*fn+self.beta*fp+self.smooth)
+        outputs = torch.sigmoid(outputs).contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        true_pos = (outputs * targets).sum()
+        false_neg = ((1 - outputs) * targets).sum()
+        false_pos = (outputs * (1 - targets)).sum()
+        tversky = (true_pos + self.smooth) / (true_pos + self.alpha * false_neg + self.beta * false_pos + self.smooth)
         return 1 - tversky
 
+# Dice Loss
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-6): super().__init__(); self.smooth=smooth
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
     def forward(self, outputs, targets):
-        outputs = torch.sigmoid(outputs).view(-1)
-        targets = targets.view(-1)
-        inter = (outputs*targets).sum()
-        dice = (2*inter+self.smooth)/(outputs.sum()+targets.sum()+self.smooth)
-        return 1-dice
+        outputs = torch.sigmoid(outputs).contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        intersection = (outputs * targets).sum()
+        dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
+        return 1 - dice
 
-
+# Dice Score
 def dice_score(outputs, targets, smooth=1e-6):
-    out_comb = torch.sigmoid(outputs).view(-1)
-    tgt_comb = targets.view(-1)
-    inter = (out_comb*tgt_comb).sum()
-    dice_comb = (2*inter)/(out_comb.sum()+tgt_comb.sum())
-    out_ch = torch.sigmoid(outputs[:,1]).view(-1)
-    tgt_ch = targets[:,1].view(-1)
-    inter_ch = (out_ch*tgt_ch).sum()
-    dice_ch = (2*inter_ch+smooth)/(out_ch.sum()+tgt_ch.sum()+smooth)
-    return dice_comb.item(), dice_ch.item()
+    outputs_combined = torch.sigmoid(outputs).contiguous().view(-1)
+    targets_combined = targets.contiguous().view(-1)
+    intersection_combined = (outputs_combined * targets_combined).sum()
+    dice_combined = (2. * intersection_combined) / (outputs_combined.sum() + targets_combined.sum())
+
+    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)
+    targets_choroid = targets[:, 1, :, :].contiguous().
+
 
 
 def find_boundaries(mask):
