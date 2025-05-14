@@ -577,7 +577,7 @@ if __name__ == '__main__':
                 param.requires_grad = False
     if args.test_only:
     # 1. Verify test dirs provided
-    assert args.test_image_dir and args.test_mask_dir, "--test_only requires --test_image_dir and --test_mask_dir"
+        assert args.test_image_dir and args.test_mask_dir, "--test_only requires --test_image_dir and --test_mask_dir"
     # 2. Build dataset and loader
     test_dataset = OCTDataset(args.test_image_dir, args.test_mask_dir,
                               transform=val_test_transform, num_classes=2)
