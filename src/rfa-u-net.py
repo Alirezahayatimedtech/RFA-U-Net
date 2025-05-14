@@ -26,10 +26,10 @@ from util.pos_embed import interpolate_pos_embed
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
-    parser.add_argument('--image_dir', type=str, required=True,
-                        help='Path to directory with OCT images')
-    parser.add_argument('--mask_dir', type=str, required=True,
-                        help='Path to directory with mask images')
+    parser.add_argument('--image_dir', type=str, default=None,
+                        help='Path to directory with OCT images (default: ./images)')
+    parser.add_argument('--mask_dir', type=str, default=None,
+                        help='Path to directory with mask images (default: ./masks)')
     parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
                         help='Path to pre-trained weights file')
     parser.add_argument('--weights_type', type=str, default='none', choices=['none','retfound','rfa-unet'],
@@ -50,8 +50,21 @@ def parse_args():
                         help='Pixel size in μm for boundary error')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Mask binarization threshold')
-    return parser.parse_args()
+    args = parser.parse_args()
 
+    # Fallback defaults if not provided
+    base_dir = os.getcwd()
+    if args.image_dir is None or args.mask_dir is None:
+        print("[INFO] No --image_dir or --mask_dir provided; using defaults ./images and ./masks")
+        if args.image_dir is None:
+            args.image_dir = os.path.join(base_dir, 'images')
+        if args.mask_dir is None:
+            args.mask_dir = os.path.join(base_dir, 'masks')
+
+    return args
+
+
+# (rest of code unchanged, starting from download_weights...)
 
 def download_weights(weights_path, url):
     if not os.path.exists(weights_path):
@@ -60,7 +73,6 @@ def download_weights(weights_path, url):
         gdown.download(url, weights_path, quiet=False)
     else:
         print(f"Weights already at {weights_path}")
-
 
 def preprocess_mask(mask_pil: Image.Image, size: tuple, num_classes: int) -> torch.Tensor:
     """
