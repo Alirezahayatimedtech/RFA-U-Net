@@ -543,6 +543,8 @@ if __name__ == '__main__':
             for imgs, msks in test_loader:
                 imgs, msks = imgs.to(device), msks.to(device)
                 outs = model(imgs)
+                print(f"Output shape: {outs.shape}, Min: {outs.min().item()}, Max: {outs.max().item()}")
+                print(f"Sigmoid output min/max: {torch.sigmoid(outs).min().item()}/{torch.sigmoid(outs).max().item()}")
                 _, dch = dice_score(outs, msks)
                 all_dice.append(dch)
                 preds = torch.sigmoid(outs).cpu().numpy()
