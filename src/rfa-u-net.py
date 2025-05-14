@@ -535,7 +535,7 @@ if __name__ == '__main__':
         )
         test_ds = OCTDataset(
             args.test_image_dir, args.test_mask_dir,
-            transform=val_test_transform, num_classes=2
+            args.image_size,transform=val_test_transform, num_classes=2
         )
         test_loader = DataLoader(
             test_ds, batch_size=args.batch_size,
