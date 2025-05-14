@@ -6,11 +6,6 @@ weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 """
 
 import os
-import sys
-import argparse
-import gdown
-import numpy as np
-from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,98 +13,81 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
+from PIL import Image
+import numpy as np
 import matplotlib.pyplot as plt
-from timm.layers import trunc_normal_
+from sklearn.metrics import confusion_matrix
+from timm.layers import drop_path, to_2tuple, trunc_normal_
 import models_vit
 from util.pos_embed import interpolate_pos_embed
-
+import argparse
+import gdown
+import sys
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
-    parser.add_argument('--image_dir', type=str, default=None,
-                        help='Path to directory with OCT images (default: ./images)')
-    parser.add_argument('--mask_dir', type=str, default=None,
-                        help='Path to directory with mask images (default: ./masks)')
+    parser.add_argument('--image_dir', type=str, required=False, help='Path to the directory containing OCT images (required for training)')
+    parser.add_argument('--mask_dir', type=str, required=False, help='Path to the directory containing mask images (required for training)')
     parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
-                        help='Path to pre-trained weights file')
-    parser.add_argument('--weights_type', type=str, default='none', choices=['none','retfound','rfa-unet'],
-                        help='Which weights to load')
-    parser.add_argument('--image_size', type=int, default=224,
-                        help='Input image size')
-    parser.add_argument('--num_epochs', type=int, default=20,
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size')
-    parser.add_argument('--test_only', action='store_true',
-                        help='Run inference on external data only')
-    parser.add_argument('--test_image_dir', type=str, default=None,
-                        help='Path to external test images')
-    parser.add_argument('--test_mask_dir', type=str, default=None,
-                        help='Path to external test masks')
-    parser.add_argument('--pixel_size_micrometers', type=float, default=10.35,
-                        help='Pixel size in μm for boundary error')
-    parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Mask binarization threshold')
-    args = parser.parse_args()
+                        help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
+    parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
+                        help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
+    parser.add_argument('--image_size', type=int, default=224, help='Input image size')
+    parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+    parser.add_argument('--test_only', action='store_true', help='Run inference on external data without training')
+    parser.add_argument('--test_image_dir', type=str, default=None, help='Path to external test images (required if --test_only)')
+    parser.add_argument('--test_mask_dir', type=str, default=None, help='Path to external test masks (required if --test_only)')
+    parser.add_argument('--pixel_size_micrometers', type=float, default=10.35, help='Pixel size in micrometers for boundary error computation')
+    parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binarizing predicted masks')
+    return parser.parse_args()
 
-    # Fallback defaults if not provided
-    base_dir = os.getcwd()
-    if args.image_dir is None or args.mask_dir is None:
-        print("[INFO] No --image_dir or --mask_dir provided; using defaults ./images and ./masks")
-        if args.image_dir is None:
-            args.image_dir = os.path.join(base_dir, 'images')
-        if args.mask_dir is None:
-            args.mask_dir = os.path.join(base_dir, 'masks')
+# Parse arguments
+args = parse_args()
 
-    return args
+# Configuration based on command-line arguments
+config = {
+    "image_size": args.image_size,
+    "hidden_dim": 1024,
+    "patch_size": 16,
+    "num_channels": 3,
+    "num_classes": 2,
+    "retfound_weights_path": args.weights_path
+}
 
+# Weights file paths
+RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
+RFA_UNET_WEIGHTS_PATH = "weights/rfa_unet_best.pth"
 
+# URL for downloading RFA-U-Net weights
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
+
+# Function to download weights if not present
 def download_weights(weights_path, url):
     if not os.path.exists(weights_path):
-        print(f"Downloading weights to {weights_path}...")
+        print(f"Weights file not found at {weights_path}. Downloading...")
         os.makedirs(os.path.dirname(weights_path), exist_ok=True)
         gdown.download(url, weights_path, quiet=False)
+        print(f"Weights downloaded to {weights_path}")
     else:
-        print(f"Weights already at {weights_path}")
+        print(f"Weights file already exists at {weights_path}")
 
+# Determine which weights to load based on weights_type
+if args.weights_type == 'retfound':
+    config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
+    print("Using RETFound weights for training from scratch")
+elif args.weights_type == 'rfa-unet':
+    if os.path.exists(args.weights_path):
+        config["retfound_weights_path"] = args.weights_path
+        print(f"Using pre-trained RFA-U-Net weights from user-provided path: {args.weights_path}")
+    else:
+        config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
+        download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
+        print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
+elif args.weights_type == 'none':
+    print("No pre-trained weights specified. Initializing model with random weights.")
 
-class OCTDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.transform = transform
-        self.num_classes = num_classes
-        self.images = sorted([f for f in os.listdir(image_dir)
-                              if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.bmp'))])
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_name = self.images[idx]
-        img_path = os.path.join(self.image_dir, img_name)
-        base_name = os.path.splitext(img_name)[0]
-        mask_name = base_name + '.tif'
-        mask_path = os.path.join(self.mask_dir, mask_name)
-
-        image = Image.open(img_path).convert('RGB')
-        mask = Image.open(mask_path).convert('L')
-
-        if self.transform:
-            image = self.transform(image)
-            mask = self.transform(mask)
-
-        mask = torch.from_numpy(np.array(mask)).long()
-        if mask.dim() == 3 and mask.shape[0] == 1:
-            mask = mask.squeeze(0)
-        if mask.dim() == 2:
-            mask = F.one_hot(mask, num_classes=self.num_classes).permute(2,0,1).float()
-        else:
-            raise ValueError(f"Unexpected mask shape: {mask.shape}")
-
-        return image, mask
-
-
+# Convolutional block for decoder
 class ConvBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -121,301 +99,499 @@ class ConvBlock(nn.Module):
             nn.BatchNorm2d(out_c),
             nn.ReLU(inplace=True)
         )
-    def forward(self,x): return self.conv(x)
 
+    def forward(self, x):
+        return self.conv(x)
 
+# Attention gate for skip connections
 class AttentionGate(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
-        self.Wg = nn.Sequential(nn.Conv2d(in_c[0], out_c,1), nn.BatchNorm2d(out_c))
-        self.Ws = nn.Sequential(nn.Conv2d(in_c[1], out_c,1), nn.BatchNorm2d(out_c))
+        self.Wg = nn.Sequential(
+            nn.Conv2d(in_c[0], out_c, kernel_size=1, padding=0),
+            nn.BatchNorm2d(out_c)
+        )
+        self.Ws = nn.Sequential(
+            nn.Conv2d(in_c[1], out_c, kernel_size=1, padding=0),
+            nn.BatchNorm2d(out_c)
+        )
         self.relu = nn.ReLU(inplace=True)
-        self.output = nn.Sequential(nn.Conv2d(out_c,out_c,1), nn.Sigmoid())
-    def forward(self,g,s):
-        g1 = self.Wg(g); s1 = self.Ws(s)
-        if g1.shape[-2:]!=s1.shape[-2:]:
-            s1 = F.interpolate(s1, size=g1.shape[-2:], mode='bilinear', align_corners=True)
-        out = self.relu(g1+s1)
+        self.output = nn.Sequential(
+            nn.Conv2d(out_c, out_c, kernel_size=1, padding=0),
+            nn.Sigmoid()
+        )
+
+    def forward(self, g, s):
+        Wg = self.Wg(g)
+        Ws = self.Ws(s)
+        if Wg.shape[-2:] != Ws.shape[-2:]:
+            Ws = nn.functional.interpolate(Ws, size=Wg.shape[-2:], mode='bilinear', align_corners=True)
+        out = self.relu(Wg + Ws)
         out = self.output(out)
-        if out.shape[-2:]!=s.shape[-2:]:
-            out = F.interpolate(out, size=s.shape[-2:], mode='bilinear', align_corners=True)
+        if out.shape[-2:] != s.shape[-2:]:
+            s = nn.functional.interpolate(s, size=out.shape[-2:], mode='bilinear', align_corners=True)
         return out * s
 
-
+# Decoder block with attention
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, reduce_skip=True):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.reduce_x = nn.Conv2d(in_c[0], out_c,1)
-        self.reduce_s = nn.Conv2d(in_c[1], out_c,1) if reduce_skip else nn.Identity()
-        self.ag = AttentionGate([out_c,out_c], out_c)
-        self.conv = ConvBlock(out_c*2, out_c)
-    def forward(self,x,s):
-        x = self.up(x); x = self.reduce_x(x)
-        s = self.reduce_s(s); s = self.ag(x,s)
-        x = torch.cat([x,s], dim=1)
-        return self.conv(x)
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        self.reduce_channels_x = nn.Conv2d(in_c[0], out_c, kernel_size=1)
+        self.reduce_channels_s = nn.Conv2d(in_c[1], out_c, kernel_size=1) if reduce_skip else nn.Identity()
+        self.ag = AttentionGate([out_c, out_c], out_c)
+        self.c1 = ConvBlock(out_c + out_c, out_c)
 
+    def forward(self, x, s):
+        x = self.up(x)
+        x = self.reduce_channels_x(x)
+        s = self.reduce_channels_s(s)
+        s = self.ag(x, s)
+        x = torch.cat([x, s], axis=1)
+        x = self.c1(x)
+        return x
 
+# Main RFA-U-Net model
 class AttentionUNetViT(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # Initialize RETFound-based ViT encoder
         self.encoder = models_vit.RETFound_mae(
-            num_classes=config['num_classes'], drop_path_rate=0.2, global_pool=True
+            num_classes=config["num_classes"],
+            drop_path_rate=0.2,
+            global_pool=True,
         )
-        self.encoder.patch_embed.proj = nn.Conv2d(3, config['hidden_dim'],
-                                                  kernel_size=(config['patch_size'],)*2,
-                                                  stride=(config['patch_size'],)*2)
-        if config.get('retfound_weights_path'):
-            ckpt = torch.load(config['retfound_weights_path'], map_location='cpu')
-            model_sd = ckpt.get('model',ckpt)
-            # remove mismatched
-            sd = self.encoder.state_dict()
-            for k in ['patch_embed.proj.weight','patch_embed.proj.bias','head.weight','head.bias']:
-                if k in model_sd and model_sd[k].shape!=sd[k].shape:
-                    del model_sd[k]
-            interpolate_pos_embed(self.encoder, model_sd)
-            self.encoder.load_state_dict(model_sd,strict=False)
-            trunc_normal_(self.encoder.head.weight, std=2e-5)
-        # decoder
-        self.d1 = DecoderBlock([config['hidden_dim'],config['hidden_dim']],512)
-        self.d2 = DecoderBlock([512,config['hidden_dim']],256)
-        self.d3 = DecoderBlock([256,config['hidden_dim']],128)
-        self.d4 = DecoderBlock([128,config['hidden_dim']],64)
-        self.output = nn.Conv2d(64, config['num_classes'],1)
-    def forward(self,x):
-        bs = x.shape[0]
+        # Modify patch embedding for 3-channel input
+        self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
+        # Load weights if specified
+        if args.weights_type in ['retfound', 'rfa-unet']:
+            if not os.path.exists(config["retfound_weights_path"]):
+                if args.weights_type == 'retfound':
+                    raise FileNotFoundError(f"RETFound weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
+                else:
+                    raise FileNotFoundError(f"RFA-U-Net weights file not found: {config['retfound_weights_path']}. Please download rfa_unet_best.pth and place it in the weights/ directory.")
+            checkpoint = torch.load(config["retfound_weights_path"], map_location='cpu')
+            print(f"Checkpoint keys: {list(checkpoint.keys())}")
+            # Check for nan values in checkpoint
+            for k, v in checkpoint.items():
+                if torch.isnan(v).any() or torch.isinf(v).any():
+                    print(f"Key {k} contains nan or inf values")
+                    raise ValueError(f"Checkpoint contains invalid values (nan/inf) in key {k}. Please use a different weights file.")
+            checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
+            if args.weights_type == 'retfound':
+                checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
+                state_dict = self.encoder.state_dict()
+                for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
+                    if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                        print(f"Removing key {k} from pretrained checkpoint")
+                        del checkpoint_model[k]
+                interpolate_pos_embed(self.encoder, checkpoint_model)
+                msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
+                print("Loaded RETFound weights, missing keys:", msg.missing_keys)
+                trunc_normal_(self.encoder.head.weight, std=2e-5)
+            else:
+                # For RFA-U-Net weights, load the entire model state dict
+                model_state_dict = self.state_dict()
+                for k in ['head.weight', 'head.bias']:
+                    if k in checkpoint and checkpoint[k].shape != model_state_dict[k].shape:
+                        print(f"Removing key {k} from pretrained checkpoint")
+                        del checkpoint[k]
+                msg = self.load_state_dict(checkpoint, strict=False)
+                print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
+
+        # Decoder blocks
+        self.d1 = DecoderBlock([1024, 1024], 512)
+        self.d2 = DecoderBlock([512, 1024], 256)
+        self.d3 = DecoderBlock([256, 1024], 128)
+        self.d4 = DecoderBlock([128, 1024], 64)
+        self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1, padding=0)
+
+    def forward(self, x):
         x = self.encoder.patch_embed(x)
-        x = x + self.encoder.pos_embed[:,1:,:]
+        batch_size, num_patches, embed_dim = x.shape
+        pos_embed = self.encoder.pos_embed[:, 1:, :]
+        if num_patches != pos_embed.shape[1]:
+            pos_embed = interpolate_pos_embed(self.encoder, {'pos_embed': pos_embed})
+        x = x + pos_embed
         x = self.encoder.pos_drop(x)
-        skips=[]
-        for i,blk in enumerate(self.encoder.blocks):
+        skip_connections = []
+        for i, blk in enumerate(self.encoder.blocks):
             x = blk(x)
-            if i in [5,11,17,23]: skips.append(x)
-        z6,z12,z18,z24 = skips
-        def to_map(z): return z.transpose(1,2).reshape(bs, z.shape[2],
-                                                       int(np.sqrt(z.shape[1])),
-                                                       int(np.sqrt(z.shape[1])))
-        z6, z12, z18, z24 = map(to_map, (z6,z12,z18,z24))
+            if i in [5, 11, 17, 23]:
+                skip_connections.append(x)
+        z6, z12, z18, z24 = skip_connections
+        z6 = z6.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
+        z12 = z12.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
+        z18 = z18.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
+        z24 = z24.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
         x = self.d1(z24, z18)
         x = self.d2(x, z12)
         x = self.d3(x, z6)
         x = self.d4(x, z6)
-        return self.output(x)
+        output = self.output(x)
+        return output
 
-
+# Tversky Loss (Aligned with root code)
 class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
-        super().__init__(); self.alpha, self.beta, self.smooth = alpha,beta,smooth
-    def forward(self,outputs,targets):
-        out = torch.sigmoid(outputs).view(-1)
-        tgt = targets.view(-1)
-        tp = (out*tgt).sum()
-        fn = ((1-out)*tgt).sum()
-        fp = (out*(1-tgt)).sum()
-        t = (tp+self.smooth)/(tp+self.alpha*fn+self.beta*fp+self.smooth)
-        return 1-t
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
 
+    def forward(self, outputs, targets):
+        outputs = torch.sigmoid(outputs).contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        true_pos = (outputs * targets).sum()
+        false_neg = ((1 - outputs) * targets).sum()
+        false_pos = (outputs * (1 - targets)).sum()
+        tversky = (true_pos + self.smooth) / (true_pos + self.alpha * false_neg + self.beta * false_pos + self.smooth)
+        return 1 - tversky
 
+# Dice Loss (Defined but not used, for compatibility with root code)
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-6): super().__init__(); self.smooth=smooth
-    def forward(self,outputs,targets):
-        out = torch.sigmoid(outputs).view(-1)
-        tgt=targets.view(-1)
-        inter=(out*tgt).sum()
-        dice=(2*inter+self.smooth)/(out.sum()+tgt.sum()+self.smooth)
-        return 1-dice
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
 
+    def forward(self, outputs, targets):
+        outputs = torch.sigmoid(outputs).contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        intersection = (outputs * targets).sum()
+        dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
+        return 1 - dice
 
+# Dice Score (Updated to compute both combined and choroid-specific Dice scores)
 def dice_score(outputs, targets, smooth=1e-6):
-    out_flat = torch.sigmoid(outputs).view(-1)
-    tgt_flat = targets.view(-1)
-    inter = (out_flat*tgt_flat).sum()
-    dice_all = (2*inter)/(out_flat.sum()+tgt_flat.sum())
-    out_ch = torch.sigmoid(outputs[:,1]).view(-1)
-    tgt_ch = targets[:,1].view(-1)
-    dice_ch = (2*(out_ch*tgt_ch).sum()+smooth)/(out_ch.sum()+tgt_ch.sum()+smooth)
-    return dice_all.item(), dice_ch.item()
+    # Compute combined Dice score (across both classes, matching root code)
+    outputs_combined = torch.sigmoid(outputs).contiguous().view(-1)
+    targets_combined = targets.contiguous().view(-1)
+    intersection_combined = (outputs_combined * targets_combined).sum()
+    dice_combined = (2. * intersection_combined) / (outputs_combined.sum() + targets_combined.sum())
 
+    # Compute choroid-specific Dice score (channel 1)
+    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)
+    targets_choroid = targets[:, 1, :, :].contiguous().view(-1)
+    intersection_choroid = (outputs_choroid * targets_choroid).sum()
+    dice_choroid = (2. * intersection_choroid + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
 
+    return dice_combined.item(), dice_choroid.item()
+
+# Boundary Detection and Error Computation
 def find_boundaries(mask):
-    ups,low=[] ,[]
-    h,w=mask.shape
-    for col in range(w):
-        ys=np.where(mask[:,col]>0)[0]
-        ups.append(int(ys[0]) if ys.size else None)
-        low.append(int(ys[-1]) if ys.size else None)
-    return ups, low
+    upper_boundaries = []
+    lower_boundaries = []
+    for col in range(mask.shape[1]):
+        non_zero_indices = np.where(mask[:, col] > 0)[0]
+        if len(non_zero_indices) > 0:
+            upper_boundaries.append(non_zero_indices[0])
+            lower_boundaries.append(non_zero_indices[-1])
+        else:
+            upper_boundaries.append(None)
+            lower_boundaries.append(None)
+    return upper_boundaries, lower_boundaries
 
+def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
+    signed_errors = []
+    unsigned_errors = []
+    for pred, gt in zip(pred_boundaries, gt_boundaries):
+        if pred is None or gt is None:
+            continue
+        signed_error = (pred - gt) * pixel_size
+        unsigned_error = abs(signed_error)
+        signed_errors.append(signed_error)
+        unsigned_errors.append(unsigned_error)
+    if not signed_errors:  # If no valid boundary pairs, return 0.0
+        print("Warning: No valid boundary pairs found for error computation. Returning 0.0.")
+        return 0.0, 0.0
+    return np.mean(signed_errors), np.mean(unsigned_errors)
 
-def compute_errors(pred_b, gt_b, pixel_size):
-    se,ue=[],[]
-    for p,g in zip(pred_b,gt_b):
-        if p is None or g is None: continue
-        d=(p-g)*pixel_size; se.append(d); ue.append(abs(d))
-    if not se: return 0.0,0.0
-    return float(np.mean(se)), float(np.mean(ue))
+# Visualization Function
+def plot_boundaries(images, true_masks, predicted_masks, threshold):
+    """
+    Plots the original image, true mask, predicted mask, and boundaries.
+    Also computes and displays the mean signed and unsigned errors in micrometers.
 
+    Parameters:
+    images (torch.Tensor): Batch of original images.
+    true_masks (torch.Tensor): Batch of true masks.
+    predicted_masks (torch.Tensor): Batch of predicted masks.
+    threshold (float): Threshold for binarizing predicted masks.
+    """
+    batch_size = images.size(0)
 
-def plot_boundaries(images, true_masks, pred_masks, threshold):
-    bs=images.shape[0]
-    for i in range(bs):
-        img=images[i].cpu().permute(1,2,0).numpy()
-        tm=true_masks[i,1].cpu().numpy()>0.5
-        pm=pred_masks[i,1].cpu().numpy()>threshold
-        pu,pl=find_boundaries(pm); gu,gl=find_boundaries(tm)
-        us,uu=compute_errors(pu,gu, args.pixel_size_micrometers)
-        ls,lu=compute_errors(pl,gl, args.pixel_size_micrometers)
-        print(f"Img {i+1} U_err:{us:.2f}/{uu:.2f}, L_err:{ls:.2f}/{lu:.2f} μm")
-        comb=img.copy()
-        for c in range(img.shape[1]):
-            if gu[c]!=None: comb[gu[c],c]=[1,0,0]
-            if gl[c]!=None: comb[gl[c],c]=[0,1,0]
-            if pu[c]!=None: comb[pu[c],c]=[0,0,1]
-            if pl[c]!=None: comb[pl[c],c]=[1,1,0]
-        plt.figure(figsize=(16,4))
-        for j,(d,title) in enumerate(zip([img,tm,pm,comb],
-                                         ['Image','True Mask','Pred Mask','Boundaries'])):
-            plt.subplot(1,4,j+1); plt.imshow(d); plt.title(title); plt.axis('off')
+    for i in range(batch_size):
+        image = images[i].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format for RGB
+        true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
+        predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
+
+        predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
+        true_mask_binary = (true_mask > 0.5).astype(np.uint8)
+
+        # Get boundaries
+        pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
+        gt_upper, gt_lower = find_boundaries(true_mask_binary)
+
+        # Compute errors in micrometers
+        upper_signed_error, upper_unsigned_error = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
+        lower_signed_error, lower_unsigned_error = compute_errors(pred_lower, gt_lower, args.pixel_size_micrometers)
+
+        # Print errors
+        print(f"Image {i + 1}:")
+        print(f"Upper Boundary Signed Error: {upper_signed_error:.2f} μm")
+        print(f"Upper Boundary Unsigned Error: {upper_unsigned_error:.2f} μm")
+        print(f"Lower Boundary Signed Error: {lower_signed_error:.2f} μm")
+        print(f"Lower Boundary Unsigned Error: {lower_unsigned_error:.2f} μm")
+
+        # Create boundary visualization
+        combined_image = image.copy()
+        for col in range(len(pred_upper)):
+            if gt_upper[col] is not None:
+                combined_image[gt_upper[col], col] = [1, 0, 0]  # Red for true upper boundary
+            if gt_lower[col] is not None:
+                combined_image[gt_lower[col], col] = [0, 1, 0]  # Green for true lower boundary
+            if pred_upper[col] is not None:
+                combined_image[pred_upper[col], col] = [0, 0, 1]  # Blue for predicted upper boundary
+            if pred_lower[col] is not None:
+                combined_image[pred_lower[col], col] = [1, 1, 0]  # Yellow for predicted lower boundary
+
+        # Plotting
+        plt.figure(figsize=(16, 8))
+        plt.subplot(1, 4, 1)
+        plt.imshow(image)
+        plt.title('Original Image')
+        plt.axis('off')
+        plt.subplot(1, 4, 2)
+        plt.imshow(true_mask_binary, cmap='gray')
+        plt.title('True Mask')
+        plt.axis('off')
+        plt.subplot(1, 4, 3)
+        plt.imshow(predicted_mask_binary, cmap='gray')
+        plt.title('Predicted Mask')
+        plt.axis('off')
+        plt.subplot(1, 4, 4)
+        plt.imshow(combined_image)
+        plt.title('Boundaries\n(True Upper: Red, True Lower: Green, Pred Upper: Blue, Pred Lower: Yellow)')
+        plt.axis('off')
         plt.show()
 
+class OCTDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.num_classes = num_classes
+        self.images = [img for img in os.listdir(image_dir) if img.endswith(('.jpg', '.JPG', '.tif'))]
+        self.images = self.images[:1000]
 
-def train_fold(train_loader, valid_loader, test_loader,
-               model, criterion, optimizer, device,
-               num_epochs, scaler, threshold):
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_name = self.images[idx]
+        mask_name = img_name.rsplit('.', 1)[0] + '.tif'
+        img_path = os.path.join(self.image_dir, img_name)
+        mask_path = os.path.join(self.mask_dir, mask_name)
+        image = Image.open(img_path).convert('RGB')
+        mask = Image.open(mask_path)
+        
+        # Convert RGB mask to single-channel
+        mask_np = np.array(mask)
+        if len(mask_np.shape) == 3:  # RGB or multi-channel
+            mask_np = mask_np[:, :, 0]  # Use first channel
+        # Map [3, 249] to [0, 1]
+        mask_np = np.where(mask_np == 3, 0, mask_np)  # Map 3 to 0
+        mask_np = np.where(mask_np == 249, 1, mask_np)  # Map 249 to 1
+        mask_np = mask_np.astype(np.uint8)
+        mask = Image.fromarray(mask_np).convert('L')
+        
+        # Debugging prints
+        print(f"Image: {img_name}, Mask: {mask_name}")
+        print(f"Mask unique values (after mapping): {np.unique(mask_np)}")
+        
+        if self.transform:
+            image = self.transform(image)
+            mask = self.transform(mask)
+        
+        mask = torch.from_numpy(np.array(mask)).long()
+        if mask.dim() == 3 and mask.shape[0] == 1:
+            mask = mask.squeeze(0)
+        if mask.dim() == 2:
+            mask = torch.nn.functional.one_hot(mask, num_classes=self.num_classes).permute(2, 0, 1).float()
+        else:
+            raise ValueError(f"Unexpected mask shape: {mask.shape}")
+        
+        # Debug final mask tensor
+        print(f"Final mask tensor shape: {mask.shape}, Unique values: {torch.unique(mask).tolist()}")
+        return image, mask
+
+# Data Transforms
+train_transform = transforms.Compose([
+    transforms.Resize((args.image_size, args.image_size)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.RandomResizedCrop(size=(args.image_size, args.image_size), scale=(0.8, 1.0)),
+    transforms.ToTensor(),
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Resize((args.image_size, args.image_size)),
+    transforms.ToTensor(),
+])
+
+# Training and Evaluation Functions
+def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler, threshold):
     model.train()
-    for e in range(num_epochs):
-        epoch_loss=0.0
-        for imgs,msks in train_loader:
-            imgs,msks=imgs.to(device),msks.to(device)
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for images, masks in train_loader:
+            images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
-            with autocast(device.type):
-                outs=model(imgs)
-                loss=criterion(outs,msks)
+            with autocast('cuda'):
+                outputs = model(images)
+                # Check for nan in outputs
+                if torch.isnan(outputs).any():
+                    print("Warning: Model outputs contain nan values")
+                    continue
+                loss = criterion(outputs, masks)
+                if torch.isnan(loss):
+                    print("Warning: Loss is nan, skipping batch")
+                    continue
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
-            scaler.step(optimizer); scaler.update()
-            epoch_loss+=loss.item()
-        print(f"Epoch {e+1}/{num_epochs} Loss:{epoch_loss/len(train_loader):.4f}")
-    model.eval()
-    dc, dch=[] ,[]
-    upe, upu, lse, lpu=[],[],[],[]
-    with torch.no_grad():
-        for imgs,msks in valid_loader:
-            imgs,msks=imgs.to(device),msks.to(device)
-            outs=model(imgs)
-            da,db=dice_score(outs,msks)
-            dc.append(da); dch.append(db)
-            pms=torch.sigmoid(outs).cpu().numpy(); tms=msks.cpu().numpy()
-            for i in range(imgs.size(0)):
-                pm,pgt = pms[i,1]>threshold, tms[i,1]>0.5
-                pu,pl=find_boundaries(pm); gu,gl=find_boundaries(pgt)
-                us,uu=compute_errors(pu,gu,args.pixel_size_micrometers)
-                ls,lu=compute_errors(pl,gl,args.pixel_size_micrometers)
-                upe.append(us); upu.append(uu)
-                lse.append(ls); lpu.append(lu)
-    # visualize test first batch
-    with torch.no_grad():
-        for imgs,msks in test_loader:
-            imgs,msks=imgs.to(device),msks.to(device)
-            outs=model(imgs)
-            plot_boundaries(imgs,msks,torch.sigmoid(outs),threshold)
-            break
-    return np.mean(dc), np.mean(dch), np.mean(upe), np.mean(upu), np.mean(lse), np.mean(lpu)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader):.4f}")
 
+    model.eval()
+    dice_combined_scores, dice_choroid_scores = [], []
+    upper_signed_errors, upper_unsigned_errors, lower_signed_errors, lower_unsigned_errors = [], [], [], []
+    with torch.no_grad():
+        for images, masks in valid_loader:
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            dice_combined, dice_choroid = dice_score(outputs, masks)  # Compute both Dice scores
+            dice_combined_scores.append(dice_combined)
+            dice_choroid_scores.append(dice_choroid)
+            predicted_masks = torch.sigmoid(outputs).cpu().numpy()
+            true_masks = masks.cpu().numpy()
+            for i in range(images.size(0)):
+                predicted_mask = predicted_masks[i, 1]  # Choroid channel
+                true_mask = true_masks[i, 1]  # Choroid channel
+               # print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
+               # print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
+                predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
+                true_mask_binary = (true_mask > 0.5).astype(np.uint8)
+                #print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
+                pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
+                gt_upper, gt_lower = find_boundaries(true_mask_binary)
+                upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
+                lower_signed, lower_unsigned = compute_errors(pred_lower, gt_lower, args.pixel_size_micrometers)
+                upper_signed_errors.append(upper_signed)
+                upper_unsigned_errors.append(upper_unsigned)
+                lower_signed_errors.append(lower_signed)
+                lower_unsigned_errors.append(lower_unsigned)
+    avg_dice_combined = np.mean(dice_combined_scores)
+    avg_dice_choroid = np.mean(dice_choroid_scores)
+    avg_upper_signed_error = np.mean(upper_signed_errors)
+    avg_upper_unsigned_error = np.mean(upper_unsigned_errors)
+    avg_lower_signed_error = np.mean(lower_signed_errors)
+    avg_lower_unsigned_error = np.mean(lower_unsigned_errors)
+
+    # Visualize the first batch from the test set
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            outputs = model(images)
+            outputs = torch.sigmoid(outputs)
+            masks = F.interpolate(masks, size=outputs.shape[2:], mode='nearest')
+            predicted_masks = outputs  # Already sigmoid applied, no thresholding here for visualization
+            plot_boundaries(images, masks, predicted_masks, threshold)
+            break  # Visualize only the first batch
+
+    return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
 
 if __name__ == '__main__':
-    args = parse_args()
-    # Set up transforms
-    train_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.RandomResizedCrop(size=(args.image_size, args.image_size), scale=(0.8, 1.0)),
-        transforms.ToTensor(),
-    ])
-    val_transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-    ])
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # weights
-    RETFOUND_PATH='weights/RETFound_oct_weights.pth'
-    RFA_PATH='weights/rfa_unet_best.pth'
-    RFA_URL='https://drive.google.com/uc?id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0'
-    if args.weights_type=='retfound':
-        download_weights(RETFOUND_PATH,None)
-        wpath=RETFOUND_PATH
-    elif args.weights_type=='rfa-unet':
-        download_weights(RFA_PATH,RFA_URL)
-        wpath=RFA_PATH
-    else: wpath=None
-    config={'image_size':args.image_size,'hidden_dim':1024,'patch_size':16,
-            'num_classes':2,'retfound_weights_path':wpath}
-    model=AttentionUNetViT(config).to(device)
-    if wpath:
-        ckpt=torch.load(wpath,map_location=device)
-        model.load_state_dict(ckpt,strict=False)
+    model = AttentionUNetViT(config).to(device)
+    for i, blk in enumerate(model.encoder.blocks):
+        if i < 23:
+            for p in blk.parameters():
+                p.requires_grad = False
+
     if args.test_only:
-        assert args.test_image_dir and args.test_mask_dir, "--test_only requires --test_image_dir and --test_mask_dir"
+        assert args.test_image_dir and args.test_mask_dir, (
+            '--test_only requires --test_image_dir and --test_mask_dir'
+        )
         test_ds = OCTDataset(
-            args.test_image_dir,
-            args.test_mask_dir,
-            transform=val_transform,
-            num_classes=2
+            args.test_image_dir, args.test_mask_dir,
+            transform=val_test_transform, num_classes=2
         )
         test_loader = DataLoader(
-            test_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True
+            test_ds, batch_size=args.batch_size,
+            shuffle=False, num_workers=2, pin_memory=True
         )
-        all_d=[]; ue=[]; le=[]
+        cp = torch.load(config['retfound_weights_path'], map_location=device)
+        model.load_state_dict(cp, strict=False)
+        model.eval()
+        all_dice, all_upper, all_lower = [], [], []
         with torch.no_grad():
-            for imgs,msks in test_loader:
-                imgs,msks=imgs.to(device),msks.to(device)
-                outs=model(imgs)
-                _,db=dice_score(outs,msks)
-                all_d.append(db)
-                pns=torch.sigmoid(outs).cpu().numpy(); tns=msks.cpu().numpy()
+            for imgs, msks in test_loader:
+                imgs, msks = imgs.to(device), msks.to(device)
+                outs = model(imgs)
+                print(f"Output shape: {outs.shape}, Min: {outs.min().item()}, Max: {outs.max().item()}")
+                print(f"Sigmoid output min/max: {torch.sigmoid(outs).min().item()}/{torch.sigmoid(outs).max().item()}")
+                _, dch = dice_score(outs, msks)
+                all_dice.append(dch)
+                preds = torch.sigmoid(outs).cpu().numpy()
+                gts = msks.cpu().numpy()
                 for i in range(imgs.size(0)):
-                    pm= pns[i,1]>args.threshold; tm=tns[i,1]>0.5
-                    pu,pl=find_boundaries(pm); gu,gl=find_boundaries(tm)
-                    us,uu=compute_errors(pu,gu,args.pixel_size_micrometers)
-                    ls,lu=compute_errors(pl,gl,args.pixel_size_micrometers)
-                    ue.append((us,uu)); le.append((ls,lu))
-        print(f"Choroid Dice: {np.mean(all_d):.4f}")
-        usm,uum=np.mean([x for x,_ in ue]),np.mean([y for _,y in ue])
-        lsm,lum=np.mean([x for x,_ in le]),np.mean([y for _,y in le])
-        print(f"Upper error: {usm:.2f}/{uum:.2f} μm  Lower error: {lsm:.2f}/{lum:.2f} μm")
+                    pm = (preds[i,1] > args.threshold).astype(np.uint8)
+                    tm = (gts[i,1] > 0.5).astype(np.uint8)
+                    pu, pl = find_boundaries(pm)
+                    gu, gl = find_boundaries(tm)
+                    us, uu = compute_errors(pu, gu, args.pixel_size_micrometers)
+                    ls, lu = compute_errors(pl, gl, args.pixel_size_micrometers)
+                    all_upper.append((us, uu))
+                    all_lower.append((ls, lu))
+        print(f"Choroid Dice on external data: {np.mean(all_dice):.4f}")
+        usm = np.mean([u for u,_ in all_upper])
+        uum = np.mean([u for _,u in all_upper])
+        lsm = np.mean([l for l,_ in all_lower])
+        lum = np.mean([l for _,l in all_lower])
+        print(f"Upper signed/unsigned error: {usm:.2f}/{uum:.2f} μm")
+        print(f"Lower signed/unsigned error: {lsm:.2f}/{lum:.2f} μm")
         sys.exit(0)
-    # split data
-    full_ds=OCTDataset(args.image_dir,args.mask_dir,
-                       image_transform=val_transform,
-                       mask_size=(args.image_size,args.image_size))
-    n=len(full_ds)
-    t=int(0.7*n); v=int(0.15*n)
-    train_ds,valid_ds,test_ds=random_split(full_ds,[t,v,n-t-v])
-    train_ds.dataset.image_transform=train_transform
-    valid_ds.dataset.image_transform=val_transform
-    test_ds.dataset.image_transform=val_transform
-    train_loader=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True,num_workers=2,pin_memory=True)
-    valid_loader=DataLoader(valid_ds,batch_size=args.batch_size,shuffle=False,num_workers=2,pin_memory=True)
-    test_loader =DataLoader(test_ds, batch_size=args.batch_size,shuffle=False,num_workers=2,pin_memory=True)
-    # freeze encoder except last block
-    for i,blk in enumerate(model.encoder.blocks):
-        if i<23:
-            for p in blk.parameters(): p.requires_grad=False
-    criterion=TverskyLoss(alpha=0.7,beta=0.3).to(device)
-    optimizer=optim.Adam(filter(lambda p:p.requires_grad,model.parameters()),lr=1e-4)
-    scaler=GradScaler()
-    results=train_fold(train_loader,valid_loader,test_loader,
-                       model,criterion,optimizer,device,
-                       args.num_epochs,scaler,args.threshold)
-    print(f"Results: Combined Dice={results[0]:.4f}, Choroid Dice={results[1]:.4f},"
-          f" Upper Err={results[2]:.2f}/{results[3]:.2f},"
-          f" Lower Err={results[4]:.2f}/{results[5]:.2f}")
+
+    # Training logic (if not test_only)
+    assert args.image_dir and args.mask_dir, (
+        '--image_dir and --mask_dir are required for training'
+    )
+    if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
+        checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded weights from {config['retfound_weights_path']}")
+    criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+    scaler = GradScaler('cuda')
+    full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
+    train_size = int(0.7 * len(full_dataset))
+    valid_size = int(0.15 * len(full_dataset))
+    test_size = len(full_dataset) - train_size - valid_size
+    train_dataset, valid_dataset, test_dataset = random_split(full_dataset, [train_size, valid_size, test_size])
+    train_dataset.dataset.transform = train_transform
+    valid_dataset.dataset.transform = val_test_transform
+    test_dataset.dataset.transform = val_test_transform
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
+        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold
+    )
+    print(f"Validation Dice (Combined): {dice_combined:.4f}, Validation Dice (Choroid): {dice_choroid:.4f}, "
+          f"Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
+          f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
