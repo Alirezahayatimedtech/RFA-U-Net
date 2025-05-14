@@ -390,7 +390,8 @@ class OCTDataset(Dataset):
 
     def __getitem__(self, idx):
         img_name = self.images[idx]
-        mask_name = img_name.replace('.jpg', '_mask.png').replace('.JPG', '_mask.png').replace('.tif', '_mask.png')
+        # Use the same base name for the mask but with .tif extension
+        mask_name = img_name.rsplit('.', 1)[0] + '.tif'
         img_path = os.path.join(self.image_dir, img_name)
         mask_path = os.path.join(self.mask_dir, mask_name)
         image = Image.open(img_path).convert('RGB')
