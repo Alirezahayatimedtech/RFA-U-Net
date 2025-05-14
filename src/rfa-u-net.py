@@ -262,20 +262,33 @@ class DiceLoss(nn.Module):
         return 1 - dice
 
 # Dice Score (Updated to compute both combined and choroid-specific Dice scores)
-def dice_score(outputs, targets, smooth=1e-6):
-    # Compute combined Dice score (across both classes, matching root code)
-    outputs_combined = torch.sigmoid(outputs).contiguous().view(-1)
-    targets_combined = targets.contiguous().view(-1)
-    intersection_combined = (outputs_combined * targets_combined).sum()
-    dice_combined = (2. * intersection_combined) / (outputs_combined.sum() + targets_combined.sum())
+def dice_score(outputs, targets, threshold=0.5, smooth=1e-6):
+    """
+    Computes the Dice coefficient on the choroid channel (channel 1) after binarization.
+    Returns the average Dice over the batch.
+    """
+    # Apply sigmoid and threshold to get hard predictions
+    preds = torch.sigmoid(outputs)
+    preds = (preds > threshold).float()
 
-    # Compute choroid-specific Dice score (channel 1)
-    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)
-    targets_choroid = targets[:, 1, :, :].contiguous().view(-1)
-    intersection_choroid = (outputs_choroid * targets_choroid).sum()
-    dice_choroid = (2. * intersection_choroid + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
+    # Extract choroid channel
+    pred_ch = preds[:, 1, :, :]  # (B, H, W)
+    true_ch = targets[:, 1, :, :]  # (B, H, W)
 
-    return dice_combined.item(), dice_choroid.item()
+    # Flatten H×W for each sample
+    pred_flat = pred_ch.view(pred_ch.size(0), -1)
+    true_flat = true_ch.view(true_ch.size(0), -1)
+
+    # Compute per-sample intersection and union
+    intersection = (pred_flat * true_flat).sum(dim=1)
+    union = pred_flat.sum(dim=1) + true_flat.sum(dim=1)
+
+    # Dice for each sample
+    dice_per_sample = (2 * intersection + smooth) / (union + smooth)
+
+    # Return mean Dice over the batch
+    return dice_per_sample.mean().item()
+
 
 # Boundary Detection and Error Computation
 def find_boundaries(mask):
