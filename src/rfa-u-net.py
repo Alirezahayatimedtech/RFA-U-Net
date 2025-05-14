@@ -64,8 +64,6 @@ def parse_args():
     return args
 
 
-# (rest of code unchanged, starting from download_weights...)
-
 def download_weights(weights_path, url):
     if not os.path.exists(weights_path):
         print(f"Downloading weights to {weights_path}...")
@@ -74,17 +72,6 @@ def download_weights(weights_path, url):
     else:
         print(f"Weights already at {weights_path}")
 
-def preprocess_mask(mask_pil: Image.Image, size: tuple, num_classes: int) -> torch.Tensor:
-    """
-    Resize mask (nearest) and one-hot encode into num_classes channels.
-    """
-    mask = mask_pil.resize(size, resample=Image.NEAREST)
-    mask_np = np.array(mask)
-    mask_bin = (mask_np > 0).astype(np.uint8)
-    mask_t = torch.from_numpy(mask_bin)
-    mask_oh = F.one_hot(mask_t, num_classes=num_classes).permute(2,0,1).float()
-    return mask_oh
-
 
 class OCTDataset(Dataset):
     def __init__(self, image_dir, mask_dir, transform=None, num_classes=2):
@@ -92,10 +79,8 @@ class OCTDataset(Dataset):
         self.mask_dir = mask_dir
         self.transform = transform
         self.num_classes = num_classes
-        # List all image files
-        self.images = [f for f in os.listdir(image_dir)
-                       if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.bmp'))]
-        self.images = sorted(self.images)
+        self.images = sorted([f for f in os.listdir(image_dir)
+                              if f.lower().endswith(('.jpg', '.jpeg', '.png', '.tif', '.bmp'))])
 
     def __len__(self):
         return len(self.images)
@@ -103,21 +88,17 @@ class OCTDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.images[idx]
         img_path = os.path.join(self.image_dir, img_name)
-        # Derive mask name from image base name, but with .png extension
         base_name = os.path.splitext(img_name)[0]
         mask_name = base_name + '.png'
         mask_path = os.path.join(self.mask_dir, mask_name)
 
-        # Load
         image = Image.open(img_path).convert('RGB')
         mask = Image.open(mask_path).convert('L')
 
-        # Apply transforms
         if self.transform:
             image = self.transform(image)
             mask = self.transform(mask)
 
-        # Convert mask to one-hot
         mask = torch.from_numpy(np.array(mask)).long()
         if mask.dim() == 3 and mask.shape[0] == 1:
             mask = mask.squeeze(0)
@@ -127,6 +108,8 @@ class OCTDataset(Dataset):
             raise ValueError(f"Unexpected mask shape: {mask.shape}")
 
         return image, mask
+
+
 class ConvBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -342,21 +325,23 @@ def train_fold(train_loader, valid_loader, test_loader,
     return np.mean(dc), np.mean(dch), np.mean(upe), np.mean(upu), np.mean(lse), np.mean(lpu)
 
 
-if __name__=='__main__':
-    args=parse_args()
-    # dynamic transforms
+if __name__ == '__main__':
+    args = parse_args()
+    # Set up transforms
     train_transform = transforms.Compose([
-        transforms.Resize((args.image_size,args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(0.2,0.2),
-        transforms.RandomResizedCrop((args.image_size,args.image_size),(0.8,1.0)),
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.RandomResizedCrop(size=(args.image_size, args.image_size), scale=(0.8, 1.0)),
         transforms.ToTensor(),
     ])
-    val_transform=transforms.Compose([
-        transforms.Resize((args.image_size,args.image_size)),
+    val_transform = transforms.Compose([
+        transforms.Resize((args.image_size, args.image_size)),
         transforms.ToTensor(),
     ])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # weights
     RETFOUND_PATH='weights/RETFound_oct_weights.pth'
     RFA_PATH='weights/rfa_unet_best.pth'
@@ -368,7 +353,6 @@ if __name__=='__main__':
         download_weights(RFA_PATH,RFA_URL)
         wpath=RFA_PATH
     else: wpath=None
-    device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config={'image_size':args.image_size,'hidden_dim':1024,'patch_size':16,
             'num_classes':2,'retfound_weights_path':wpath}
     model=AttentionUNetViT(config).to(device)
@@ -380,7 +364,7 @@ if __name__=='__main__':
         test_ds = OCTDataset(
             args.test_image_dir,
             args.test_mask_dir,
-            transform=val_test_transform,
+            transform=val_transform,
             num_classes=2
         )
         test_loader = DataLoader(
