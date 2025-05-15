@@ -97,17 +97,15 @@ if args.weights_type == 'retfound':
     os.makedirs(os.path.dirname(RETFOUND_WEIGHTS_PATH), exist_ok=True)
 
     if os.path.exists(RETFOUND_WEIGHTS_PATH):
-        # local copy is already there
         config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
     else:
-        # fetch from HuggingFace
         config["retfound_weights_path"] = download_retfound_weights_hf(
-            repo_id="rmaphoh/RETFound_MAE",
+            repo_id="YukunZhou/RETFound_mae_natureOCT",
             filename="RETFound_mae_natureOCT.pth",
             cache_dir="weights"
         )
     print(f"→ RETFound weights at {config['retfound_weights_path']}")
-
+    
 elif args.weights_type == 'rfa-unet':
     if os.path.exists(args.weights_path):
         config["retfound_weights_path"] = args.weights_path
