@@ -496,20 +496,22 @@ val_test_transform = transforms.Compose([
     transforms.Resize((args.image_size, args.image_size)),
     transforms.ToTensor(),
 ])
-
 # Training and Evaluation Functions
 def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler, threshold):
-    model.train()
+    # track best validation choroid‐dice
+    best_choroid = -1.0
+
     for epoch in range(num_epochs):
+        # — training pass —
+        model.train()
         running_loss = 0.0
         for images, masks in train_loader:
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
             with autocast('cuda'):
                 outputs = model(images)
-                # Check for nan in outputs
                 if torch.isnan(outputs).any():
-                    print("Warning: Model outputs contain nan values")
+                    print("Warning: Model outputs contain nan values, skipping batch")
                     continue
                 loss = criterion(outputs, masks)
                 if torch.isnan(loss):
@@ -517,11 +519,41 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
                     continue
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item()
-        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {running_loss / len(train_loader):.4f}")
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}")
+
+        # — validation pass —
+        model.eval()
+        dice_choroid_scores = []
+        with torch.no_grad():
+            for images, masks in valid_loader:
+                images, masks = images.to(device), masks.to(device)
+                outputs = model(images)
+                _, dch = dice_score(outputs, masks)
+                dice_choroid_scores.append(dch)
+
+        avg_choroid = np.mean(dice_choroid_scores)
+        print(f"  → Validation Choroid Dice: {avg_choroid:.4f}")
+
+        # — save best checkpoint —
+        if avg_choroid > best_choroid:
+            best_choroid = avg_choroid
+            ckpt = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'val_choroid_dice': best_choroid
+            }
+            os.makedirs("weights", exist_ok=True)
+            torch.save(ckpt, "weights/best_rfa_unet.pth")
+            print(f"💾 New best checkpoint saved: weights/best_rfa_unet.pth")
+
+    # — after all epochs, run full evaluation on validation & test sets as before —
 
     model.eval()
     dice_combined_scores, dice_choroid_scores = [], []
@@ -530,27 +562,23 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            dice_combined, dice_choroid = dice_score(outputs, masks)  # Compute both Dice scores
+            dice_combined, dice_choroid = dice_score(outputs, masks)
             dice_combined_scores.append(dice_combined)
             dice_choroid_scores.append(dice_choroid)
             predicted_masks = torch.sigmoid(outputs).cpu().numpy()
             true_masks = masks.cpu().numpy()
             for i in range(images.size(0)):
-                predicted_mask = predicted_masks[i, 1]  # Choroid channel
-                true_mask = true_masks[i, 1]  # Choroid channel
-               # print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
-               # print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
-                predicted_mask_binary = (predicted_mask > args.threshold).astype(np.uint8)
-                # we know true_mask is already 0/1, so just test for ==1
-                true_mask_binary = (true_mask == 1).astype(np.uint8)                #print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
-                pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
-                gt_upper, gt_lower = find_boundaries(true_mask_binary)
-                upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
-                lower_signed, lower_unsigned = compute_errors(pred_lower, gt_lower, args.pixel_size_micrometers)
-                upper_signed_errors.append(upper_signed)
-                upper_unsigned_errors.append(upper_unsigned)
-                lower_signed_errors.append(lower_signed)
-                lower_unsigned_errors.append(lower_unsigned)
+                pm = (predicted_masks[i,1] > threshold).astype(np.uint8)
+                tm = (true_masks[i,1] == 1).astype(np.uint8)
+                pu, pl = find_boundaries(pm)
+                gu, gl = find_boundaries(tm)
+                us, uu = compute_errors(pu, gu, args.pixel_size_micrometers)
+                ls, lu = compute_errors(pl, gl, args.pixel_size_micrometers)
+                upper_signed_errors.append(us)
+                upper_unsigned_errors.append(uu)
+                lower_signed_errors.append(ls)
+                lower_unsigned_errors.append(lu)
+
     avg_dice_combined = np.mean(dice_combined_scores)
     avg_dice_choroid = np.mean(dice_choroid_scores)
     avg_upper_signed_error = np.mean(upper_signed_errors)
@@ -561,16 +589,14 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
     # Visualize the first batch from the test set
     with torch.no_grad():
         for images, masks in test_loader:
-            images = images.to(device)
-            masks = masks.to(device)
-            outputs = model(images)
-            outputs = torch.sigmoid(outputs)
+            images, masks = images.to(device), masks.to(device)
+            outputs = torch.sigmoid(model(images))
             masks = F.interpolate(masks, size=outputs.shape[2:], mode='nearest')
-            predicted_masks = outputs  # Already sigmoid applied, no thresholding here for visualization
-            plot_boundaries(images, masks, predicted_masks, threshold)
-            break  # Visualize only the first batch
+            plot_boundaries(images, masks, outputs, threshold)
+            break
 
     return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
+
 
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
