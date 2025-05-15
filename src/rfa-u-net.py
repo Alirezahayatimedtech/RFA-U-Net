@@ -197,39 +197,50 @@ class AttentionUNetViT(nn.Module):
         self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
         # Load weights if specified
         if args.weights_type in ['retfound', 'rfa-unet']:
+            # ensure file exists
             if not os.path.exists(config["retfound_weights_path"]):
-                if args.weights_type == 'retfound':
-                    raise FileNotFoundError(f"RETFound weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
-                else:
-                    raise FileNotFoundError(f"RFA-U-Net weights file not found: {config['retfound_weights_path']}. Please download rfa_unet_best.pth and place it in the weights/ directory.")
-            checkpoint = torch.load(config["retfound_weights_path"], map_location='cpu',    weights_only=False)
-            print(f"Checkpoint keys: {list(checkpoint.keys())}")
-            # Check for nan values in checkpoint
-            for k, v in checkpoint.items():
-                if torch.isnan(v).any() or torch.isinf(v).any():
-                    print(f"Key {k} contains nan or inf values")
-                    raise ValueError(f"Checkpoint contains invalid values (nan/inf) in key {k}. Please use a different weights file.")
-            checkpoint = torch.load(config["retfound_weights_path"], map_location='cuda', weights_only=False)
+                raise FileNotFoundError(
+                    f"{args.weights_type}-weights file not found: "
+                    f"{config['retfound_weights_path']}. Please download it and place it under `weights/`."
+                )
+
+            # 1) load full checkpoint (may include optimizer, epoch, etc.)
+            raw_ckpt = torch.load(
+                config["retfound_weights_path"],
+                map_location='cpu',
+                weights_only=False
+            )
+            print("Checkpoint keys:", list(raw_ckpt.keys()))
+
+            # 2) extract just the model tensors
+            state_dict = raw_ckpt.get('model', raw_ckpt)
+
+            # 3) sanity‐check only the tensor values
+            for k, v in state_dict.items():
+                if torch.is_tensor(v):
+                    if torch.isnan(v).any() or torch.isinf(v).any():
+                        raise ValueError(f"Checkpoint tensor '{k}' contains NaN or Inf")
+
+            # 4) move tensors to GPU if available
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            state_dict = {k: v.to(device) for k, v in state_dict.items()}
+
             if args.weights_type == 'retfound':
-                checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
-                state_dict = self.encoder.state_dict()
+                # remove incompatible keys, interpolate positional embeddings
+                own = self.encoder.state_dict()
                 for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
-                    if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                    if k in state_dict and state_dict[k].shape != own[k].shape:
                         print(f"Removing key {k} from pretrained checkpoint")
-                        del checkpoint_model[k]
-                interpolate_pos_embed(self.encoder, checkpoint_model)
-                msg = self.encoder.load_state_dict(checkpoint_model, strict=False)
+                        del state_dict[k]
+                interpolate_pos_embed(self.encoder, state_dict)
+                msg = self.encoder.load_state_dict(state_dict, strict=False)
                 print("Loaded RETFound weights, missing keys:", msg.missing_keys)
                 trunc_normal_(self.encoder.head.weight, std=2e-5)
             else:
-                # For RFA-U-Net weights, load the entire model state dict
-                model_state_dict = self.state_dict()
-                for k in ['head.weight', 'head.bias']:
-                    if k in checkpoint and checkpoint[k].shape != model_state_dict[k].shape:
-                        print(f"Removing key {k} from pretrained checkpoint")
-                        del checkpoint[k]
-                msg = self.load_state_dict(checkpoint, strict=False)
+                # pure RFA-U-Net checkpoint
+                msg = self.load_state_dict(state_dict, strict=False)
                 print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
+
 
         # Decoder blocks
         self.d1 = DecoderBlock([1024, 1024], 512)
