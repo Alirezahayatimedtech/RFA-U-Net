@@ -23,6 +23,23 @@ from util.pos_embed import interpolate_pos_embed
 import argparse
 import gdown
 import sys
+from huggingface_hub import hf_hub_download, RepositoryNotFoundError
+
+def download_retfound_weights_hf(repo_id: str, filename: str, cache_dir: str = "weights"):
+    """
+    Download `filename` from the HF repo `repo_id` into cache_dir and return local path.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            cache_dir=cache_dir,
+        )
+        print(f"✅ Downloaded {filename} from HF repo {repo_id} to {path}")
+        return path
+    except RepositoryNotFoundError as e:
+        raise FileNotFoundError(f"Could not find {repo_id}/{filename} on HF. {e}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
@@ -57,12 +74,12 @@ config = {
 
 # Weights file paths
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
-RFA_UNET_WEIGHTS_PATH = "weights/rfa_unet_best.pth"
+RFA_UNET_WEIGHTS_PATH  = "weights/rfa_unet_best.pth"
 
 # URL for downloading RFA-U-Net weights
 RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
 
-# Function to download weights if not present
+# Function to download RFA-U-Net weights (unchanged)
 def download_weights(weights_path, url):
     if not os.path.exists(weights_path):
         print(f"Weights file not found at {weights_path}. Downloading...")
@@ -74,16 +91,32 @@ def download_weights(weights_path, url):
 
 # Determine which weights to load based on weights_type
 if args.weights_type == 'retfound':
-    config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
     print("Using RETFound weights for training from scratch")
+    # ensure the folder exists
+    os.makedirs(os.path.dirname(RETFOUND_WEIGHTS_PATH), exist_ok=True)
+
+    if os.path.exists(RETFOUND_WEIGHTS_PATH):
+        # local copy is already there
+        config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
+    else:
+        # fetch from HuggingFace
+        config["retfound_weights_path"] = download_retfound_weights_hf(
+            repo_id="rmaphoh/RETFound_MAE",
+            filename="RETFound_mae_natureOCT.pth",
+            cache_dir="weights"
+        )
+    print(f"→ RETFound weights at {config['retfound_weights_path']}")
+
 elif args.weights_type == 'rfa-unet':
     if os.path.exists(args.weights_path):
         config["retfound_weights_path"] = args.weights_path
         print(f"Using pre-trained RFA-U-Net weights from user-provided path: {args.weights_path}")
     else:
+        # fallback to Google-Drive download
         config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
         download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
         print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
+
 elif args.weights_type == 'none':
     print("No pre-trained weights specified. Initializing model with random weights.")
 
