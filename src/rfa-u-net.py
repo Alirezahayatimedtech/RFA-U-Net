@@ -213,8 +213,12 @@ class AttentionUNetViT(nn.Module):
             )
             print("Checkpoint keys:", list(raw_ckpt.keys()))
 
-            # 2) extract just the model tensors
-            state_dict = raw_ckpt.get('model', raw_ckpt)
+            # 2) extract just the model state dict (under model_state_dict or model)
+            state_dict = raw_ckpt.get(
+                'model_state_dict',
+                raw_ckpt.get('model', raw_ckpt)
+            )
+            
 
             # 3) sanity‐check only the tensor values
             for k, v in state_dict.items():
@@ -488,7 +492,10 @@ train_transform = transforms.Compose([
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomRotation(degrees=15),
     transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.RandomResizedCrop(size=(args.image_size, args.image_size), scale=(0.8, 1.0)),
+    transforms.RandomResizedCrop(
+        size=(args.image_size, args.image_size),
+        scale=(0.8, 1.0)
+    ),
     transforms.ToTensor(),
 ])
 
