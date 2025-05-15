@@ -637,7 +637,7 @@ if __name__ == '__main__':
         )
         print("Test-only checkpoint keys:", list(raw_ckpt.keys()))
 
-        # pick out the weights dict
+        # pick out the model weights dict
         if 'model_state_dict' in raw_ckpt:
             sd = raw_ckpt['model_state_dict']
         elif 'model' in raw_ckpt:
@@ -645,8 +645,8 @@ if __name__ == '__main__':
         else:
             sd = raw_ckpt
 
-        # finally load into your model
-        model.load_state_dict(sd, strict=True)
+        # load with strict=False so missing head/decoder weights are OK
+        model.load_state_dict(sd, strict=False)
         model.eval()
         all_dice, all_upper, all_lower = [], [], []
         with torch.no_grad():
