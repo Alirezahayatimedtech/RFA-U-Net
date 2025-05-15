@@ -202,7 +202,7 @@ class AttentionUNetViT(nn.Module):
                     raise FileNotFoundError(f"RETFound weights file not found: {config['retfound_weights_path']}. Please download RETFound_oct_weights.pth from https://github.com/rmaphoh/RETFound_MAE and place it in the weights/ directory.")
                 else:
                     raise FileNotFoundError(f"RFA-U-Net weights file not found: {config['retfound_weights_path']}. Please download rfa_unet_best.pth and place it in the weights/ directory.")
-            checkpoint = torch.load(config["retfound_weights_path"], map_location='cpu')
+            checkpoint = torch.load(config["retfound_weights_path"], map_location='cpu',    weights_only=False)
             print(f"Checkpoint keys: {list(checkpoint.keys())}")
             # Check for nan values in checkpoint
             for k, v in checkpoint.items():
@@ -621,7 +621,7 @@ if __name__ == '__main__':
         '--image_dir and --mask_dir are required for training'
     )
     if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
-        checkpoint = torch.load(config["retfound_weights_path"], map_location=device)
+        checkpoint = torch.load(config["retfound_weights_path"], map_location=device ,     weights_only=False)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded weights from {config['retfound_weights_path']}")
     criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)
