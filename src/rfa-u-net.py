@@ -629,8 +629,14 @@ if __name__ == '__main__':
             test_ds, batch_size=args.batch_size,
             shuffle=False, num_workers=2, pin_memory=True
         )
-        cp = torch.load(config['retfound_weights_path'], map_location=device , weights_only=False)
-        model.load_state_dict(cp, strict=False)
+        ckpt = torch.load(
+            config['retfound_weights_path'],
+            map_location=device,
+            weights_only=False
+        )
+        # pull out just the model weights
+        model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        
         model.eval()
         all_dice, all_upper, all_lower = [], [], []
         with torch.no_grad():
