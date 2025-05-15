@@ -236,17 +236,23 @@ class TverskyLoss(nn.Module):
     def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
         super().__init__()
         self.alpha = alpha
-        self.beta = beta
+        self.beta  = beta
         self.smooth = smooth
 
     def forward(self, outputs, targets):
-        outputs = torch.sigmoid(outputs).contiguous().view(-1)
-        targets = targets.contiguous().view(-1)
-        true_pos = (outputs * targets).sum()
-        false_neg = ((1 - outputs) * targets).sum()
-        false_pos = (outputs * (1 - targets)).sum()
-        tversky = (true_pos + self.smooth) / (true_pos + self.alpha * false_neg + self.beta * false_pos + self.smooth)
+        # outputs: (B,2,H,W), targets: one‐hot (B,2,H,W)
+        probs = torch.sigmoid(outputs[:,1,:,:])         # only choroid channel
+        t      = targets[:,1,:,:]                       # only choroid channel
+        p_flat = probs.contiguous().view(-1)
+        t_flat = t.contiguous().view(-1)
+
+        tp = (p_flat * t_flat).sum()
+        fn = ((1 - p_flat) * t_flat).sum()
+        fp = (p_flat * (1 - t_flat)).sum()
+
+        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
         return 1 - tversky
+
 
 # Dice Loss (Defined but not used, for compatibility with root code)
 class DiceLoss(nn.Module):
