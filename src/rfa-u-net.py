@@ -629,14 +629,24 @@ if __name__ == '__main__':
             test_ds, batch_size=args.batch_size,
             shuffle=False, num_workers=2, pin_memory=True
         )
-        ckpt = torch.load(
+        # load the full checkpoint (may include optimizer, epoch, etc.)
+        raw_ckpt = torch.load(
             config['retfound_weights_path'],
             map_location=device,
             weights_only=False
         )
-        # pull out just the model weights
-        model.load_state_dict(ckpt['model_state_dict'], strict=True)
-        
+        print("Test-only checkpoint keys:", list(raw_ckpt.keys()))
+
+        # pick out the weights dict
+        if 'model_state_dict' in raw_ckpt:
+            sd = raw_ckpt['model_state_dict']
+        elif 'model' in raw_ckpt:
+            sd = raw_ckpt['model']
+        else:
+            sd = raw_ckpt
+
+        # finally load into your model
+        model.load_state_dict(sd, strict=True)
         model.eval()
         all_dice, all_upper, all_lower = [], [], []
         with torch.no_grad():
