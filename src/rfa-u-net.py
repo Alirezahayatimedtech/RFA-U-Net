@@ -325,8 +325,9 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
         predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
 
-        predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
-        true_mask_binary = (true_mask > 0.5).astype(np.uint8)
+        predicted_mask_binary = (predicted_mask > args.threshold).astype(np.uint8)
+        # we know true_mask is already 0/1, so just test for ==1
+        true_mask_binary = (true_mask == 1).astype(np.uint8)
 
         # Get boundaries
         pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
@@ -407,8 +408,8 @@ class OCTDataset(Dataset):
         mask_np = np.array(mask_pil)
         if mask_np.ndim == 3:                        
             mask_np = mask_np[..., 0]                # drop channels
-        mask_np = np.where(mask_np == 3,   0, mask_np)
-        mask_np = np.where(mask_np == 249, 1, mask_np)
+       # map background (3) → 0, foreground (249) → 1, everything else → 0
+        mask_np = np.where(mask_np == 249, 1, 0)
         mask_np = mask_np.astype(np.uint8)
 
         # apply only to image
@@ -489,9 +490,9 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
                 true_mask = true_masks[i, 1]  # Choroid channel
                # print(f"Image {i+1} - True mask sum: {true_mask.sum()}, Predicted mask sum: {predicted_mask.sum()}")
                # print(f"Predicted mask max: {predicted_mask.max()}, min: {predicted_mask.min()}")
-                predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)
-                true_mask_binary = (true_mask > 0.5).astype(np.uint8)
-                #print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
+                predicted_mask_binary = (predicted_mask > args.threshold).astype(np.uint8)
+                # we know true_mask is already 0/1, so just test for ==1
+                true_mask_binary = (true_mask == 1).astype(np.uint8)                #print(f"Image {i+1} - True mask binary sum: {true_mask_binary.sum()}, Predicted mask binary sum: {predicted_mask_binary.sum()}")
                 pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
                 gt_upper, gt_lower = find_boundaries(true_mask_binary)
                 upper_signed, upper_unsigned = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
