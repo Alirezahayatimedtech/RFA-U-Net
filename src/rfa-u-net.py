@@ -535,8 +535,11 @@ if __name__ == '__main__':
             '--test_only requires --test_image_dir and --test_mask_dir'
         )
         test_ds = OCTDataset(
-            args.test_image_dir, args.test_mask_dir,
-            transform=val_test_transform, num_classes=2
+            args.test_image_dir,          # image_dir
+            args.test_mask_dir,           # mask_dir
+            args.image_size,              # image_size 
+            transform=val_test_transform, # transform
+
         )
         test_loader = DataLoader(
             test_ds, batch_size=args.batch_size,
@@ -585,7 +588,7 @@ if __name__ == '__main__':
     criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     scaler = GradScaler('cuda')
-    full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform, num_classes=2)
+    full_dataset = OCTDataset(args.image_dir, args.mask_dir, transform=val_test_transform,args.image_size, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
     valid_size = int(0.15 * len(full_dataset))
     test_size = len(full_dataset) - train_size - valid_size
