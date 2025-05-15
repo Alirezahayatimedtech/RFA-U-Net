@@ -23,7 +23,8 @@ from util.pos_embed import interpolate_pos_embed
 import argparse
 import gdown
 import sys
-from huggingface_hub import hf_hub_download, RepositoryNotFoundError
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import RepositoryNotFoundError
 
 def download_retfound_weights_hf(repo_id: str, filename: str, cache_dir: str = "weights"):
     """
