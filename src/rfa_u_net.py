@@ -82,7 +82,7 @@ RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
 RFA_UNET_WEIGHTS_PATH  = "weights/rfa_unet_best.pth"
 
 # URL for downloading RFA-U-Net weights
-RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
 
 # Function to download RFA-U-Net weights (unchanged)
 def download_weights(weights_path, url):
