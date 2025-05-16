@@ -1,74 +1,60 @@
-
 # RFA-U-Net: RETFound Attention U-Net for OCT Choroid Segmentation
 
-**RFA-U-Net** is a deep learning model designed to segment the **choroid** in Optical Coherence Tomography (OCT) images. It combines a **Vision Transformer (ViT)** encoder pre-trained with **RETFound** weights and an **Attention U-Net** decoder. The model is optimized using **Tversky** and **Dice** losses and evaluated via **Dice scores** and **boundary error metrics** (in micrometers).
+**RFA-U-Net** is a deep learning model to segment the **choroid** in Optical Coherence Tomography (OCT) images. It uses a **RETFound**-pretrained Vision Transformer (ViT) encoder and an **Attention U-Net** decoder, trained with Tversky/Dice losses and evaluated via Dice scores and micrometer-scale boundary errors.
 
 ---
 
 ## 🚀 Key Features
 
-- **Encoder**: RETFound Vision Transformer for advanced feature extraction  
-- **Decoder**: Attention U-Net with skip connections for precise segmentation  
-- **Losses**: Tversky and Dice loss to handle class imbalance  
-- **Metrics**: Dice score, boundary errors (signed/unsigned, in μm)  
-- **Visualization**: Boundary overlays with true vs. predicted masks  
+- **Encoder**: RETFound MAE ViT backbone  
+- **Decoder**: Attention U-Net with gated skip connections  
+- **Losses**: Tversky + Dice to handle class imbalance  
+- **Metrics**:  
+  - Dice score (overall & choroid-only)  
+  - Signed/Unsigned boundary errors (μm)  
+- **Visualization**: Four-panel view & overlay boundary plots  
 
 ---
 
-## 📰 Related Research
-
-Hayati *et al.* “RFA-U-Net: Choroid Segmentation in OCT with RETFound Attention U-Net,” *medRxiv* (2025).  
-[DOI: 10.1101/2025.05.03.25326923](https://www.medrxiv.org/content/10.1101/2025.05.03.25326923v1)
-
----
-
-## 📁 Repository Structure
+## 📁 Repo Structure
 
 ```
 
 RFA-U-Net/
 ├── src/
-│   ├── rfa-u-net.py          # Main model script (train, infer, external test)
-│   ├── models\_vit.py         # RETFound-based ViT implementation
+│   ├── rfa-u-net.py          # Main train/infer script
+│   ├── models\_vit.py         # RETFound ViT implementation
 │   └── util/
-│       └── pos\_embed.py      # Positional-embedding interpolation
+│       └── pos\_embed.py      # Positional embedding utils
 ├── examples/
-│   ├── sample\_image.jpg
-│   ├── sample\_mask.png
-│   ├── sample\_output.png
-│   └── visualization.ipynb   # Notebook for qualitative results
+│   └── visualization.ipynb   # Qualitative demo notebook
 ├── weights/
-│   └── README.md             # Info on downloading pre‐trained weights
-├── README.md                 # This file
-├── LICENSE
-└── requirements.txt
+│   └── README.md             # How to download pretrained weights
+├── requirements.txt
+└── README.md                 # You are here
 
-```
+````
 
 ---
 
 ## ⚙️ Requirements
 
 - Python 3.8+  
-- PyTorch 1.9.0+  
-- NVIDIA GPU (strongly recommended)  
-- Dependencies (from `requirements.txt`):
-```
+- PyTorch 1.9+  
+- NVIDIA GPU recommended  
+- See `requirements.txt` for full list:
+  ```text
+  torch>=1.9.0
+  torchvision>=0.10.0
+  numpy>=1.19.0
+  matplotlib>=3.3.0
+  scikit-learn>=0.24.0
+  timm>=0.4.12
+  huggingface-hub>=0.14.1
+  gdown>=4.7.1
+  Pillow>=8.0.0
+  rarfile>=4.0
 
-torch>=1.9.0
-torchvision>=0.10.0
-numpy>=1.19.0
-matplotlib>=3.3.0
-scikit-learn>=0.24.0
-optuna>=2.10.0
-timm>=0.4.12
-tqdm>=4.61.0
-Pillow>=8.0.0
-gdown>=4.7.1
-
-````
-
----
 
 ## 🛠 Installation
 
@@ -76,9 +62,17 @@ gdown>=4.7.1
 git clone https://github.com/Alirezahayatimedtech/RFA-U-Net.git
 cd RFA-U-Net
 pip install -r requirements.txt
-````
+```
 
-> **Note:** If you choose `--weights_type rfa-unet`, the script will auto-download `rfa_unet_best.pth` via `gdown`.
+### 🔐 Hugging Face Authentication
+
+If you plan to load **RETFound** weights from HF Hub, set your token:
+
+```bash
+export HUGGINGFACE_HUB_TOKEN="hf_yourTokenHere"
+# or
+huggingface-cli login
+```
 
 ---
 
@@ -87,47 +81,37 @@ pip install -r requirements.txt
 ```
 data/
 ├── images/
-│   ├── image1.jpg
-│   └── image2.jpg
+│   ├── sample1.jpg
+│   └── sample2.jpg
 └── masks/
-    ├── image1_mask.png
-    └── image2_mask.png
+    ├── sample1_mask.png
+    └── sample2_mask.png
 ```
 
-* **Images**: RGB OCT images
-* **Masks**: Corresponding binary masks (use suffix `_mask.png`)
-* **Note**: You must supply your own data; no dataset is included here.
+* **Images**: RGB OCT scans (`.jpg`)
+* **Masks**: Binary masks (`.png`) matching `*_mask.png` suffix
 
 ---
 
 ## 🎯 External-Data-Only Testing
 
-Evaluate a pre-trained model on your own images/masks without any training:
+Evaluate pre-trained RFA-U-Net on your own data (no training):
 
 ```bash
 python src/rfa-u-net.py \
   --test_only \
-  --test_image_dir path/to/external/images \
-  --test_mask_dir  path/to/external/masks \
+  --test_image_dir path/to/images \
+  --test_mask_dir  path/to/masks \
   --weights_type rfa-unet \
   --threshold 0.5 \
   --pixel_size_micrometers 12.5
 ```
 
-* `--test_only`
-  Run in inference-only mode, skipping all training.
-* `--test_image_dir`
-  Directory of OCT images to evaluate.
-* `--test_mask_dir`
-  Directory of ground-truth masks.
-* `--weights_type {none|retfound|rfa-unet}`
-  Choose which pretrained weights to load.
-* `--threshold`
-  Binarization threshold for predicted masks (default `0.5`).
-* `--pixel_size_micrometers`
-  Pixel size in μm for computing boundary errors (default `10.35`).
+* `--test_only`: skip training
+* `--threshold`: binarization cutoff (default 0.5)
+* `--pixel_size_micrometers`: μm/pixel (default 10.35)
 
-**Output**:
+**Sample output**:
 
 ```
 Choroid Dice on external data: 0.9523
@@ -139,7 +123,7 @@ Lower signed/unsigned error:  1.12/20.50 μm
 
 ## 🧠 Training & Inference
 
-### Train from scratch (no pre-trained)
+### 1. From scratch (no pre-training)
 
 ```bash
 python src/rfa-u-net.py \
@@ -150,7 +134,7 @@ python src/rfa-u-net.py \
   --batch_size 4
 ```
 
-### Fine-tune using RETFound weights
+### 2. Fine-tune with RETFound
 
 ```bash
 python src/rfa-u-net.py \
@@ -161,7 +145,9 @@ python src/rfa-u-net.py \
   --batch_size 8
 ```
 
-### Fine-tune using RFA-U-Net weights
+### 3. Fine-tune with RFA-U-Net
+
+(Default downloads via gdown if not present)
 
 ```bash
 python src/rfa-u-net.py \
@@ -176,71 +162,37 @@ python src/rfa-u-net.py \
 
 ## 📊 Results Snapshot
 
-| Metric                    | Value   |
-| ------------------------- | ------- |
-| Dice Score (Test)         | \~0.95  |
-| Upper Signed Error (μm)   | \~-0.89 |
-| Upper Unsigned Error (μm) | \~6.04  |
-| Lower Signed Error (μm)   | \~1.05  |
-| Lower Unsigned Error (μm) | \~21.4  |
+| Metric                    | Value  |
+| ------------------------- | ------ |
+| Dice Score (choroid)      | \~0.95 |
+| Upper Signed Error (μm)   | \~–0.9 |
+| Upper Unsigned Error (μm) | \~6.0  |
+| Lower Signed Error (μm)   | \~1.1  |
+| Lower Unsigned Error (μm) | \~21.4 |
 
 ---
 
 ## 🖼 Example Outputs
 
-![Sample segmentation overlay](examples/sample_output.png)
+![Boundary overlay example](examples/sample_output.png)
 
 ---
 
-## 🔧 Advanced Settings
+## 📬 Contact & Citation
 
-Customize image size, epochs, batch, etc.:
+Hayati *et al.* “RFA-U-Net: Choroid Segmentation in OCT with RETFound Attention U-Net,” *medRxiv* (2025).
+DOI: 10.1101/2025.05.03.25326923
 
-```bash
-python src/rfa-u-net.py \
-  --image_dir my_data/images \
-  --mask_dir my_data/masks \
-  --weights_type rfa-unet \
-  --weights_path /path/to/rfa_unet_best.pth \
-  --image_size 256 \
-  --num_epochs 30 \
-  --batch_size 4 \
-  --pixel_size_micrometers 12.5 \
-  --threshold 0.6
-```
+For issues or questions, open a GitHub Issue or email **[alirezahayati17@yahoo.com](mailto:alirezahayati17@yahoo.com)**.
 
 ---
 
-## 🙏 Acknowledgments
+##  Contributors
 
-* ViT & RETFound code from [RETFound\_MAE](https://github.com/rmaphoh/RETFound_MAE)
-* Inspired by U-Net and Transformer architectures
-
----
-
-## 📄 License
+* **Alireza Hayati** – Lead developer
+* **Roya Arian** – Mentor
+* **Narges Sa** – Mentor
 
 MIT License. See [LICENSE](LICENSE).
 
----
 
-## 📬 Contact
-
-For issues or questions, please open a GitHub Issue or email: [alirezahayati17@yahoo.com](mailto:alirezahayati17@yahoo.com)
-
----
-
-
----
-
-## 🤝 Contributors
-
-* **Alireza Hayati** – Lead developer
-* **Roya Arian** – Training support & Mentor
-* **Narges Sa** – Training support & Mentor
-
----
-
-## 🔖 Tags
-
-\#DeepLearning #MedicalImaging #OCT #ChoroidSegmentation #VisionTransformer #UNet #RETFound #PyTorch #BiomedicalImaging #MedicalAI #ImageSegmentation
