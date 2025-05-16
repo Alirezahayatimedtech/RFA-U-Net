@@ -26,6 +26,9 @@ import gdown
 import sys
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
+from dataset import OCTDataset
+
+
 
 def download_retfound_weights_hf(repo_id: str, filename: str, cache_dir: str = "weights"):
     """
@@ -429,62 +432,6 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         plt.title('Boundaries\n(True Upper: Red, True Lower: Green, Pred Upper: Blue, Pred Lower: Yellow)')
         plt.axis('off')
         plt.show()
-
-class OCTDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2):
-        self.image_dir   = image_dir
-        self.mask_dir    = mask_dir
-        self.image_size  = image_size
-        self.transform   = transform      # only for images
-        self.num_classes = num_classes
-
-        # only keep .jpg/.JPG files
-        self.images = [
-            fname for fname in os.listdir(self.image_dir)
-            if fname.lower().endswith('.jpg')
-        ]
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_name  = self.images[idx]
-        base, _   = os.path.splitext(img_name)
-        mask_name = base + '.tif'                      # same base name, .tif extension
-
-        # load
-        img_path  = os.path.join(self.image_dir, img_name)
-        mask_path = os.path.join(self.mask_dir,  mask_name)
-        image     = Image.open(img_path).convert('RGB')
-        mask_pil  = Image.open(mask_path)
-
-        # map any unwanted labels → {0,1}
-        mask_np = np.array(mask_pil)
-        if mask_np.ndim == 3:                        
-            mask_np = mask_np[..., 0]                # drop channels
-       # map background (3) → 0, foreground (249) → 1, everything else → 0
-        mask_np = np.where(mask_np == 249, 1, 0)
-        mask_np = mask_np.astype(np.uint8)
-
-        # apply only to image
-        if self.transform:
-            image = self.transform(image)
-
-        # resize mask _after_ mapping, with nearest-neighbor
-        mask_pil = Image.fromarray(mask_np)
-        mask_pil = mask_pil.resize(
-            (self.image_size, self.image_size),
-            resample=Image.NEAREST
-        )
-        mask_np = np.array(mask_pil)                # still 0 or 1
-
-        # to one-hot tensor
-        mask_tensor = torch.from_numpy(mask_np).long()                      # (H, W)
-        mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes)  # (H, W, C)
-        mask_onehot = mask_onehot.permute(2, 0, 1).float()                  # (C, H, W)
-
-        return image, mask_onehot
-
 
 # Data Transforms
 train_transform = transforms.Compose([
