@@ -79,8 +79,8 @@ def viz_four_panel(image, true_mask, pred_prob, thresh=0.5):
 
 # %%
 # 2) Run inference & visualize first 20 samples
-test_image_dir = "external_data/diabetic/diabetic"
-test_mask_dir  = "external_data/Mask graylevel/Mask_graylevel"
+test_image_dir = "path/to/data"
+test_mask_dir  = "path/to/mask"
 ds = OCTDataset(test_image_dir, test_mask_dir, config["image_size"], transform=val_test_transform)
 
 for i in range(min(20, len(ds))):
