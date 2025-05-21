@@ -38,31 +38,35 @@ class OCTDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
+        # paths
         img_path  = self.image_paths[idx]
         mask_path = self.mask_paths[idx]
 
-        # Load image and mask
+        # load
         image    = Image.open(img_path).convert('RGB')
         mask_pil = Image.open(mask_path).convert('L')
 
-        # Binarize mask (e.g., label 249 → 1, else → 0)
+        # binarize mask on any non-zero pixel
         mask_np = np.array(mask_pil)
-        if mask_np.ndim == 3:
-            mask_np = mask_np[..., 0]
-        mask_np = np.where(mask_np == 249, 1, 0).astype(np.uint8)
+        mask_np = (mask_np > 0).astype(np.uint8)
 
-        # Apply transform to image if provided
+        # apply image transform if given
         if self.transform:
             image = self.transform(image)
 
-        # Resize mask with nearest-neighbor
+        # resize mask
         mask_pil = Image.fromarray(mask_np)
-        mask_pil = mask_pil.resize((self.image_size, self.image_size), resample=Image.NEAREST)
-        mask_np  = np.array(mask_pil)
+        mask_pil = mask_pil.resize(
+            (self.image_size, self.image_size),
+            resample=Image.NEAREST
+        )
+        mask_np = np.array(mask_pil)
 
-        # One-hot encode mask
+        # one-hot encode
         mask_tensor = torch.from_numpy(mask_np).long()
         mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes)
         mask_onehot = mask_onehot.permute(2, 0, 1).float()
 
         return image, mask_onehot
+
+
