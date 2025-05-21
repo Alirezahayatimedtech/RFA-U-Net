@@ -6,50 +6,52 @@ import torch.nn.functional as F
 
 class OCTDataset(torch.utils.data.Dataset):
     def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2):
-        self.image_dir   = image_dir
-        self.mask_dir    = mask_dir
         self.image_size  = image_size
         self.transform   = transform
         self.num_classes = num_classes
 
-        # Accept .jpg, .jpeg, .png, .tif, .tiff
-        exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff')
-        self.images = [
-            fname for fname in os.listdir(self.image_dir)
-            if fname.lower().endswith(exts)
-        ]
+        # Supported extensions
+        exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
+
+        # Build mapping from basename → filename for images
+        image_map = {}
+        for fname in os.listdir(image_dir):
+            base, ext = os.path.splitext(fname)
+            if ext.lower() in exts:
+                image_map[base] = fname
+
+        # Build mapping from basename → filename for masks
+        mask_map = {}
+        for fname in os.listdir(mask_dir):
+            base, ext = os.path.splitext(fname)
+            if ext.lower() in exts:
+                mask_map[base] = fname
+
+        # Keep only basenames present in both
+        common_bases = sorted(set(image_map.keys()) & set(mask_map.keys()))
+
+        # Prepare full paths
+        self.image_paths = [os.path.join(image_dir, image_map[b]) for b in common_bases]
+        self.mask_paths  = [os.path.join(mask_dir,  mask_map[b]) for b in common_bases]
 
     def __len__(self):
-        return len(self.images)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img_name = self.images[idx]
-        base, _  = os.path.splitext(img_name)
-
-        # Find a matching mask file with same base and one of the exts
-        mask_exts = ('.tif', '.tiff', '.png', '.jpg', '.jpeg')
-        mask_name = None
-        for me in mask_exts:
-            candidate = base + me
-            if os.path.exists(os.path.join(self.mask_dir, candidate)):
-                mask_name = candidate
-                break
-        if mask_name is None:
-            raise FileNotFoundError(f"No mask found for base '{base}' in {self.mask_dir}")
+        img_path  = self.image_paths[idx]
+        mask_path = self.mask_paths[idx]
 
         # Load image and mask
-        img_path  = os.path.join(self.image_dir, img_name)
-        mask_path = os.path.join(self.mask_dir, mask_name)
-        image     = Image.open(img_path).convert('RGB')
-        mask_pil  = Image.open(mask_path).convert('L')
+        image    = Image.open(img_path).convert('RGB')
+        mask_pil = Image.open(mask_path).convert('L')
 
-        # Map unwanted labels → {0,1}
+        # Binarize mask (e.g., label 249 → 1, else → 0)
         mask_np = np.array(mask_pil)
         if mask_np.ndim == 3:
             mask_np = mask_np[..., 0]
         mask_np = np.where(mask_np == 249, 1, 0).astype(np.uint8)
 
-        # Apply transforms to image
+        # Apply transform to image if provided
         if self.transform:
             image = self.transform(image)
 
