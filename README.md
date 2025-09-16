@@ -157,6 +157,10 @@ python src/rfa-u-net.py \
   --num_epochs 15 \
   --batch_size 8
 ```
+## 📥 Download Link for RFA-U-Net pretrained weights
+
+### URL for pretrained weights (Google Drive link)
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
 
 ---
 
