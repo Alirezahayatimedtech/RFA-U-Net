@@ -84,12 +84,12 @@ data/
 │   ├── sample1.jpg
 │   └── sample2.jpg
 └── masks/
-    ├── sample1_mask.png
-    └── sample2_mask.png
+    ├── sample1.png
+    └── sample2.png
 ```
 
 * **Images**: RGB OCT scans (`.jpg`)
-* **Masks**: Binary masks (`.png`) matching `*_mask.png` suffix
+* **Masks**: Binary masks (`.png`) matching 
 
 ---
 
