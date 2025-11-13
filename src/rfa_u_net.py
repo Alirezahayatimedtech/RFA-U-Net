@@ -27,6 +27,7 @@ import sys
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from dataset import OCTDataset
+from dataset import OCTSegmentationDataset
 
 
 
@@ -452,6 +453,78 @@ val_test_transform = transforms.Compose([
     transforms.Resize((args.image_size, args.image_size)),
     transforms.ToTensor(),
 ])
+def save_segmentation_results(images, filenames, original_sizes, predicted_masks, output_dir, save_overlay=False, threshold=0.5):
+    """
+    Save segmentation results as masks and optionally as overlay images
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    mask_dir = os.path.join(output_dir, 'masks')
+    os.makedirs(mask_dir, exist_ok=True)
+    
+    if save_overlay:
+        overlay_dir = os.path.join(output_dir, 'overlays')
+        os.makedirs(overlay_dir, exist_ok=True)
+    
+    for i, (image, filename, original_size) in enumerate(zip(images, filenames, original_sizes)):
+        base_name = os.path.splitext(filename)[0]
+        
+        # Get predicted mask for choroid class
+        pred_mask = predicted_masks[i, 1].cpu().numpy()
+        pred_mask_binary = (pred_mask > threshold).astype(np.uint8) * 255
+        
+        # Resize mask to original image size
+        pred_mask_pil = Image.fromarray(pred_mask_binary)
+        pred_mask_pil = pred_mask_pil.resize(original_size, Image.NEAREST)
+        
+        # Save mask
+        mask_path = os.path.join(mask_dir, f'{base_name}_mask.png')
+        pred_mask_pil.save(mask_path)
+        
+        if save_overlay:
+            # Create overlay image
+            image_np = image.cpu().numpy().transpose(1, 2, 0)
+            # Denormalize if needed (assuming image is in [0,1])
+            if image_np.max() <= 1.0:
+                image_np = (image_np * 255).astype(np.uint8)
+            else:
+                image_np = image_np.astype(np.uint8)
+            
+            # Create overlay
+            overlay = create_overlay_image(image_np, pred_mask_binary, original_size)
+            overlay_path = os.path.join(overlay_dir, f'{base_name}_overlay.png')
+            overlay.save(overlay_path)
+            
+        print(f"Saved segmentation for {filename}")
+
+def create_overlay_image(image_np, mask_binary, original_size):
+    """
+    Create an overlay image with segmentation boundaries
+    """
+    # Resize mask to original size
+    mask_pil = Image.fromarray(mask_binary)
+    mask_resized = mask_pil.resize(original_size, Image.NEAREST)
+    mask_np = np.array(mask_resized)
+    
+    # Find boundaries
+    upper_boundaries, lower_boundaries = find_boundaries((mask_np > 0).astype(np.uint8))
+    
+    # Create RGB image from grayscale if needed
+    if len(image_np.shape) == 2:
+        image_rgb = np.stack([image_np] * 3, axis=-1)
+    else:
+        image_rgb = image_np
+    
+    # Draw boundaries
+    overlay_image = image_rgb.copy()
+    for col in range(len(upper_boundaries)):
+        if upper_boundaries[col] is not None:
+            row = min(upper_boundaries[col], overlay_image.shape[0]-1)
+            overlay_image[row, col] = [255, 0, 0]  # Red for upper boundary
+        if lower_boundaries[col] is not None:
+            row = min(lower_boundaries[col], overlay_image.shape[0]-1)
+            overlay_image[row, col] = [0, 255, 0]  # Green for lower boundary
+    
+    return Image.fromarray(overlay_image)
 # Training and Evaluation Functions
 def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler, threshold):
     # track best validation choroid‐dice
