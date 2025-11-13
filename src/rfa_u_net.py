@@ -451,6 +451,8 @@ train_transform = transforms.Compose([
 val_test_transform = transforms.Compose([
     transforms.Resize((args.image_size, args.image_size)),
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  
+
 ])
 def save_segmentation_results(images, filenames, original_sizes, predicted_masks, output_dir, save_overlay=False, threshold=0.5):
     """
@@ -459,51 +461,68 @@ def save_segmentation_results(images, filenames, original_sizes, predicted_masks
     os.makedirs(output_dir, exist_ok=True)
     mask_dir = os.path.join(output_dir, 'masks')
     os.makedirs(mask_dir, exist_ok=True)
-    
     if save_overlay:
         overlay_dir = os.path.join(output_dir, 'overlays')
         os.makedirs(overlay_dir, exist_ok=True)
-    
+
     for i, (image, filename, original_size) in enumerate(zip(images, filenames, original_sizes)):
         base_name = os.path.splitext(filename)[0]
-        
-        # Get predicted mask for choroid class
-        pred_mask = predicted_masks[i, 1].cpu().numpy()
+
+        # Get predicted mask for choroid class (channel 1)
+        pred_mask = predicted_masks[i, 1].cpu().numpy()  # Shape: (H, W)
+
+        # === DEBUG: inspect raw prediction stats ===
+        print(f"[DEBUG] File: {filename}")
+        print(f"  Original image size: {original_size} (type: {type(original_size)})")
+        print(f"  Prediction shape: {pred_mask.shape}")
+        print(f"  Prediction min: {pred_mask.min():.6f}, max: {pred_mask.max():.6f}, mean: {pred_mask.mean():.6f}")
+        print(f"  Threshold: {threshold}")
+
+        # Apply threshold to get binary mask
         pred_mask_binary = (pred_mask > threshold).astype(np.uint8) * 255
-        
-        # Resize mask to original image size - FIXED
+
+        # === DEBUG: check if mask is all zero ===
+        if pred_mask_binary.sum() == 0:
+            print(f"  ⚠️  WARNING: Binarized mask is ALL BLACK! No pixels above threshold.")
+            # Optional: temporarily save raw probability map for inspection
+            raw_mask_pil = Image.fromarray((pred_mask * 255).astype(np.uint8))
+            raw_mask_path = os.path.join(mask_dir, f'{base_name}_rawprob.png')
+            raw_mask_pil.save(raw_mask_path)
+            print(f"    → Saved raw probability map to: {raw_mask_path}")
+
+        # Resize mask to original image size
         pred_mask_pil = Image.fromarray(pred_mask_binary)
-        
+
         # Ensure original_size is in correct format (width, height)
         if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
-            # original_size is already (width, height)
-            target_size = original_size
+            target_size = original_size  # (width, height)
         else:
-            # Fallback: use a default size or try to extract from image
-            print(f"Warning: Unexpected original_size format: {original_size}. Using fallback.")
-            target_size = (224, 224)  # Default fallback
-        
+            print(f"  ❌ Unexpected original_size format: {original_size}. Using fallback (224, 224).")
+            target_size = (224, 224)
+
+        print(f"  Resizing mask from {pred_mask_pil.size} to {target_size}")
         pred_mask_pil = pred_mask_pil.resize(target_size, Image.NEAREST)
-        
-        # Save mask
+
+        # Save final mask
         mask_path = os.path.join(mask_dir, f'{base_name}_mask.png')
         pred_mask_pil.save(mask_path)
-        
+        print(f"  ✅ Saved segmentation mask to: {mask_path}")
+
         if save_overlay:
             # Create overlay image
             image_np = image.cpu().numpy().transpose(1, 2, 0)
-            # Denormalize if needed (assuming image is in [0,1])
             if image_np.max() <= 1.0:
                 image_np = (image_np * 255).astype(np.uint8)
             else:
                 image_np = image_np.astype(np.uint8)
-            
-            # Create overlay
-            overlay = create_overlay_image(image_np, pred_mask_binary, target_size)
+
+            # Also resize raw binary mask to target_size for overlay
+            mask_for_overlay = np.array(pred_mask_pil)
+            overlay = create_overlay_image(image_np, mask_for_overlay, target_size)
             overlay_path = os.path.join(overlay_dir, f'{base_name}_overlay.png')
             overlay.save(overlay_path)
-            
-        print(f"Saved segmentation for {filename} to {mask_path}")
+            print(f"  ✅ Saved overlay to: {overlay_path}")
+
 
 
 
