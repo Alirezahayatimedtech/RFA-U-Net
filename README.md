@@ -160,7 +160,7 @@ python src/rfa_u_net.py \
 ## 📥 Download Link for RFA-U-Net pretrained weights
 
 ### URL for pretrained weights (Google Drive link)
-RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/file/d/1zDEdAmNwNK8I-QEa6fqL5E3WjDn7Z-__/view?usp=sharing"
 
 ---
 
