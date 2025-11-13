@@ -700,7 +700,7 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             shuffle=False, 
             num_workers=2, 
-            pin_memory=True
+            pin_memory=True,
             collate_fn=custom_collate  # <<< ADD THIS
 
         )
