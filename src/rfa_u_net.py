@@ -471,9 +471,19 @@ def save_segmentation_results(images, filenames, original_sizes, predicted_masks
         pred_mask = predicted_masks[i, 1].cpu().numpy()
         pred_mask_binary = (pred_mask > threshold).astype(np.uint8) * 255
         
-        # Resize mask to original image size
+        # Resize mask to original image size - FIXED
         pred_mask_pil = Image.fromarray(pred_mask_binary)
-        pred_mask_pil = pred_mask_pil.resize(original_size, Image.NEAREST)
+        
+        # Ensure original_size is in correct format (width, height)
+        if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
+            # original_size is already (width, height)
+            target_size = original_size
+        else:
+            # Fallback: use a default size or try to extract from image
+            print(f"Warning: Unexpected original_size format: {original_size}. Using fallback.")
+            target_size = (224, 224)  # Default fallback
+        
+        pred_mask_pil = pred_mask_pil.resize(target_size, Image.NEAREST)
         
         # Save mask
         mask_path = os.path.join(mask_dir, f'{base_name}_mask.png')
@@ -486,14 +496,17 @@ def save_segmentation_results(images, filenames, original_sizes, predicted_masks
             if image_np.max() <= 1.0:
                 image_np = (image_np * 255).astype(np.uint8)
             else:
-                image_np = image_np.astype(np.uint8)
+                image_np = image_np.astype(np.uin
+                                           t8)
             
             # Create overlay
-            overlay = create_overlay_image(image_np, pred_mask_binary, original_size)
+            overlay = create_overlay_image(image_np, pred_mask_binary, target_size)
             overlay_path = os.path.join(overlay_dir, f'{base_name}_overlay.png')
             overlay.save(overlay_path)
             
-        print(f"Saved segmentation for {filename}")
+        print(f"Saved segmentation for {filename} to {mask_path}")
+
+
 
 def create_overlay_image(image_np, mask_binary, original_size):
     """
@@ -648,12 +661,15 @@ class OCTSegmentationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
-        original_size = image.size  # Store original size for saving results
+        original_size = image.size  # This returns (width, height)
         
         if self.transform:
             image = self.transform(image)
             
         return image, os.path.basename(img_path), original_size
+
+
+
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
