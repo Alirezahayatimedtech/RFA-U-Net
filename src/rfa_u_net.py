@@ -50,7 +50,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
     parser.add_argument('--image_dir', type=str, required=False, help='Path to the directory containing OCT images (required for training)')
     parser.add_argument('--mask_dir', type=str, required=False, help='Path to the directory containing mask images (required for training)')
-    parser.add_argument('--weights_path', type=str, default='weights/rfa_unet_best.pth',
+    parser.add_argument('--weights_path', type=str, default='weights/best_rfa_unet.pth',
                         help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
     parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
                         help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
@@ -81,10 +81,10 @@ config = {
 
 # Weights file paths
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
-RFA_UNET_WEIGHTS_PATH  = "weights/rfa_unet_best.pth"
+RFA_UNET_WEIGHTS_PATH  = "weights/best_rfa_unet.pth"
 
 # URL for downloading RFA-U-Net weights
-RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1q2giAcI8ASe2qnA9L69Mqb01l2qKjTV0"
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/file/d/1zDEdAmNwNK8I-QEa6fqL5E3WjDn7Z-__/view?usp=sharing"
 
 # Function to download RFA-U-Net weights (unchanged)
 def download_weights(weights_path, url):
