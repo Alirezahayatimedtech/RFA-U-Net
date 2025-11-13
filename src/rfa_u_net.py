@@ -626,9 +626,10 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
 
     return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
 
-
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     model = AttentionUNetViT(config).to(device)
     
     # Freeze early layers if using pre-trained weights
@@ -717,76 +718,6 @@ if __name__ == '__main__':
             print(f"   - Overlays saved to: {os.path.join(args.output_dir, 'overlays')}")
         sys.exit(0)
 
-    # ===== TEST-ONLY MODE (With ground truth masks) =====
-    if args.test_only:
-        assert args.test_image_dir and args.test_mask_dir, (
-            '--test_only requires --test_image_dir and --test_mask_dir'
-        )
-        test_ds = OCTDataset(
-            args.test_image_dir,          # image_dir
-            args.test_mask_dir,           # mask_dir
-            args.image_size,              # image_size 
-            transform=val_test_transform,
-            num_classes=2
-        )
-        test_loader = DataLoader(
-            test_ds, batch_size=args.batch_size,
-            shuffle=False, num_workers=2, pin_memory=True
-        )
-        
-        # Load the full checkpoint
-        if os.path.exists(config['retfound_weights_path']):
-            raw_ckpt = torch.load(
-                config['retfound_weights_path'],
-                map_location=device,
-                weights_only=False
-            )
-            print("Test-only checkpoint keys:", list(raw_ckpt.keys()))
-
-            # Pick out the model weights dict
-            if 'model_state_dict' in raw_ckpt:
-                sd = raw_ckpt['model_state_dict']
-            elif 'model' in raw_ckpt:
-                sd = raw_ckpt['model']
-            else:
-                sd = raw_ckpt
-
-            # Load with strict=False so missing head/decoder weights are OK
-            model.load_state_dict(sd, strict=False)
-            print("✅ Model weights loaded successfully")
-        else:
-            print(f"❌ Error: Weight file not found at {config['retfound_weights_path']}")
-            sys.exit(1)
-            
-        model.eval()
-        all_dice, all_upper, all_lower = [], [], []
-        with torch.no_grad():
-            for imgs, msks in test_loader:
-                imgs, msks = imgs.to(device), msks.to(device)
-                outs = model(imgs)
-                _, dch = dice_score(outs, msks)
-                all_dice.append(dch)
-                preds = torch.sigmoid(outs).cpu().numpy()
-                gts = msks.cpu().numpy()
-                for i in range(imgs.size(0)):
-                    pm = (preds[i,1] > args.threshold).astype(np.uint8)
-                    tm = (gts[i,1] > 0.5).astype(np.uint8)
-                    pu, pl = find_boundaries(pm)
-                    gu, gl = find_boundaries(tm)
-                    us, uu = compute_errors(pu, gu, args.pixel_size_micrometers)
-                    ls, lu = compute_errors(pl, gl, args.pixel_size_micrometers)
-                    all_upper.append((us, uu))
-                    all_lower.append((ls, lu))
-        
-        print(f"\n📊 Evaluation Results on External Data:")
-        print(f"   Choroid Dice: {np.mean(all_dice):.4f}")
-        usm = np.mean([u for u,_ in all_upper])
-        uum = np.mean([u for _,u in all_upper])
-        lsm = np.mean([l for l,_ in all_lower])
-        lum = np.mean([l for _,l in all_lower])
-        print(f"   Upper signed/unsigned error: {usm:.2f}/{uum:.2f} μm")
-        print(f"   Lower signed/unsigned error: {lsm:.2f}/{lum:.2f} μm")
-        sys.exit(0)
 
     # ===== TRAINING MODE =====
     assert args.image_dir and args.mask_dir, (
