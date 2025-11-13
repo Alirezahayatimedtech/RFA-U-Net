@@ -236,7 +236,7 @@ The script prints per-image debug info (prediction stats, resize shapes) and war
 ### URL for pretrained weights (Google Drive link)
 
 ```text
-RFA_UNET_WEIGHTS_URL = "https://drive.google.com/file/d/1zDEdAmNwNK8I-QEa6fqL5E3WjDn7Z-__/view?usp=sharing"
+RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1zDEdAmNwNK8I-QEa6fqL5E3WjDn7Z-__"
 ```
 
 The script will automatically download to:
