@@ -27,7 +27,6 @@ import sys
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from dataset import OCTDataset
-from dataset import OCTSegmentationDataset
 
 
 
@@ -386,7 +385,7 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
         predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
 
-        predicted_mask_binary = (predicted_mask > args.threshold).astype(np.uint8)
+        predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)  # FIXED: use parameter
         # we know true_mask is already 0/1, so just test for ==1
         true_mask_binary = (true_mask == 1).astype(np.uint8)
 
@@ -436,7 +435,6 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         plt.title('Boundaries\n(True Upper: Red, True Lower: Green, Pred Upper: Blue, Pred Lower: Yellow)')
         plt.axis('off')
         plt.show()
-
 # Data Transforms
 train_transform = transforms.Compose([
     transforms.Resize((args.image_size, args.image_size)),
@@ -626,7 +624,36 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             break
 
     return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
+class OCTSegmentationDataset(torch.utils.data.Dataset):
+    def __init__(self, image_dir, image_size, transform=None):
+        self.image_size = image_size
+        self.transform = transform
+        
+        # Supported extensions
+        exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
+        
+        # Build list of image paths
+        self.image_paths = []
+        for fname in os.listdir(image_dir):
+            _, ext = os.path.splitext(fname)
+            if ext.lower() in exts:
+                self.image_paths.append(os.path.join(image_dir, fname))
+        
+        # Sort for consistent ordering
+        self.image_paths = sorted(self.image_paths)
 
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        original_size = image.size  # Store original size for saving results
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, os.path.basename(img_path), original_size
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
