@@ -496,8 +496,7 @@ def save_segmentation_results(images, filenames, original_sizes, predicted_masks
             if image_np.max() <= 1.0:
                 image_np = (image_np * 255).astype(np.uint8)
             else:
-                image_np = image_np.astype(np.uin
-                                           t8)
+                image_np = image_np.astype(np.uint8)
             
             # Create overlay
             overlay = create_overlay_image(image_np, pred_mask_binary, target_size)
