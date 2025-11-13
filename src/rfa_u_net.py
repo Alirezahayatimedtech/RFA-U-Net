@@ -455,9 +455,10 @@ val_test_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  
 
 ])
-def save_segmentation_results(images, filenames, original_sizes, predicted_masks, output_dir, save_overlay=False, threshold=0.5):
+def save_segmentation_results(filenames, original_sizes, predicted_masks, output_dir, segment_dir, save_overlay=False, threshold=0.5):
     """
-    Save segmentation results as masks and optionally as overlay images
+    Save segmentation results as masks and optionally as overlay images.
+    FIXED: Loads original images directly from disk for overlays instead of using transformed tensors.
     """
     os.makedirs(output_dir, exist_ok=True)
     mask_dir = os.path.join(output_dir, 'masks')
@@ -466,82 +467,110 @@ def save_segmentation_results(images, filenames, original_sizes, predicted_masks
         overlay_dir = os.path.join(output_dir, 'overlays')
         os.makedirs(overlay_dir, exist_ok=True)
 
-    for i, (image, filename, original_size) in enumerate(zip(images, filenames, original_sizes)):
+    for i in range(len(filenames)):
+        filename = filenames[i]
         base_name = os.path.splitext(filename)[0]
+        original_size = original_sizes[i]  # (width, height)
 
         # Get predicted mask for choroid class (channel 1)
         pred_mask = predicted_masks[i, 1].cpu().numpy()
         pred_mask_binary = (pred_mask > threshold).astype(np.uint8) * 255
 
-        # Ensure original_size is (width, height)
+        # Ensure original_size is in correct format (width, height)
         if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
-            target_size = original_size  # (width, height)
+            target_size = (int(original_size[0]), int(original_size[1]))  # (width, height)
         else:
-            print(f"Warning: Unexpected original_size format: {original_size}. Using fallback.")
+            print(f"⚠️ Warning: Unexpected original_size format: {original_size}. Using fallback 224x224.")
             target_size = (224, 224)
 
-        # Resize predicted mask to original image size
-        pred_mask_pil = Image.fromarray(pred_mask_binary)
+        # Resize predicted mask to original image dimensions
+        pred_mask_pil = Image.fromarray(pred_mask_binary.astype(np.uint8))
         pred_mask_resized = pred_mask_pil.resize(target_size, Image.NEAREST)
         mask_for_overlay = np.array(pred_mask_resized)
 
         # Save final binary mask
         mask_path = os.path.join(mask_dir, f'{base_name}_mask.png')
         pred_mask_resized.save(mask_path)
-        print(f"Saved segmentation for {filename} to {mask_path}")
+        print(f"💾 Saved segmentation mask: {mask_path}")
 
         if save_overlay:
-            # Convert normalized tensor image back to numpy (HWC, uint8)
-            image_np = image.cpu().numpy().transpose(1, 2, 0)
-            if image_np.max() <= 1.0:
-                image_np = (image_np * 255).astype(np.uint8)
-            else:
-                image_np = image_np.astype(np.uint8)
-
-            # Resize image to original size to match mask
-            image_pil = Image.fromarray(image_np)
-            image_resized = image_pil.resize(target_size, Image.BILINEAR)
-            image_resized_np = np.array(image_resized)
-
-            # Create overlay using resized image and resized mask
-            overlay = create_overlay_image(image_resized_np, mask_for_overlay)
-            overlay_path = os.path.join(overlay_dir, f'{base_name}_overlay.png')
-            overlay.save(overlay_path)
-
+            try:
+                # CRITICAL FIX: Load ORIGINAL image directly from disk
+                img_path = os.path.join(segment_dir, filename)
+                original_image = Image.open(img_path).convert('RGB')
+                
+                # Handle size mismatch between recorded size and actual image
+                if original_image.size != target_size:
+                    print(f"⚠️ Size mismatch for {filename}: recorded {target_size} vs actual {original_image.size}. Resizing image.")
+                    original_image = original_image.resize(target_size, Image.LANCZOS)
+                
+                # Create overlay using ACTUAL original pixels
+                overlay = create_overlay_image(np.array(original_image), mask_for_overlay)
+                overlay_path = os.path.join(overlay_dir, f'{base_name}_overlay.png')
+                overlay.save(overlay_path)
+                print(f"✅ Saved overlay: {overlay_path}")
+                
+            except Exception as e:
+                print(f"❌ Error creating overlay for {filename}: {str(e)}")
+                continue
 
 def create_overlay_image(image_np, mask_np):
     """
-    Create an overlay image with segmentation boundaries.
-    Assumes image_np and mask_np are already the same size (H, W, C) and (H, W).
+    Create an overlay image with segmentation boundaries using original pixel data.
+    FIXED: Proper boundary detection and drawing with bounds checking.
     """
-    # Ensure image is RGB
-    if len(image_np.shape) == 2:
-        image_rgb = np.stack([image_np] * 3, axis=-1)
-    else:
-        image_rgb = image_np
-
-    # Ensure mask is binary
-    binary_mask = (mask_np > 0).astype(np.uint8)
-
-    # Find boundaries
+    # Ensure we're working with clean copies in correct format
+    overlay_image = image_np.copy().astype(np.uint8)
+    binary_mask = (mask_np > 0).astype(np.uint8)  # Ensure binary mask
+    
+    # Find boundaries (column-wise processing)
     upper_boundaries, lower_boundaries = find_boundaries(binary_mask)
-    overlay_image = image_rgb.copy()
-
+    
+    # Draw boundaries with bounds checking
     H, W = overlay_image.shape[:2]
-    for col in range(len(upper_boundaries)):
-        if col >= W:
-            continue  # safety guard
+    for col in range(W):
+        if col >= len(upper_boundaries) or col >= len(lower_boundaries):
+            continue
+            
+        # Upper boundary (red) - check bounds
         if upper_boundaries[col] is not None:
-            row = min(upper_boundaries[col], H - 1)
-            overlay_image[row, col] = [255, 0, 0]  # Red for upper boundary
+            row = int(upper_boundaries[col])
+            if 0 <= row < H and 0 <= col < W:
+                overlay_image[row, col] = [255, 0, 0]  # Red
+        
+        # Lower boundary (green) - check bounds
         if lower_boundaries[col] is not None:
-            row = min(lower_boundaries[col], H - 1)
-            overlay_image[row, col] = [0, 255, 0]  # Green for lower boundary
-
+            row = int(lower_boundaries[col])
+            if 0 <= row < H and 0 <= col < W:
+                overlay_image[row, col] = [0, 255, 0]  # Green
+    
     return Image.fromarray(overlay_image)
-# Training and Evaluation Functions
+
+def find_boundaries(mask):
+    """
+    Find upper and lower boundaries for each column in a binary mask.
+    FIXED: Proper column-wise processing with robust handling of empty columns.
+    """
+    upper_boundaries = []
+    lower_boundaries = []
+    
+    # Process each column (x-coordinate)
+    for col in range(mask.shape[1]):
+        col_data = mask[:, col]
+        non_zero_indices = np.where(col_data > 0)[0]
+        
+        if len(non_zero_indices) > 0:
+            upper_boundaries.append(non_zero_indices[0])    # First non-zero from top
+            lower_boundaries.append(non_zero_indices[-1])   # Last non-zero from top
+        else:
+            upper_boundaries.append(None)
+            lower_boundaries.append(None)
+            
+    return upper_boundaries, lower_boundaries
+
+# Training and Evaluation Functions (unchanged from original)
 def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler, threshold):
-    # track best validation choroid‐dice
+    # track best validation choroid-dice
     best_choroid = -1.0
 
     for epoch in range(num_epochs):
@@ -639,6 +668,7 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
             break
 
     return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
+
 class OCTSegmentationDataset(torch.utils.data.Dataset):
     def __init__(self, image_dir, image_size, transform=None):
         self.image_size = image_size
@@ -665,11 +695,9 @@ class OCTSegmentationDataset(torch.utils.data.Dataset):
             image = self.transform(image)
         return image, os.path.basename(img_path), original_size
 
-
-
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"🚀 Using device: {device}")
     
     model = AttentionUNetViT(config).to(device)
     
@@ -682,7 +710,7 @@ if __name__ == '__main__':
 
     # ===== SEGMENTATION MODE (No masks needed) =====
     if args.segment_dir:
-        print(f"Running segmentation on images in: {args.segment_dir}")
+        print(f"🔍 Running segmentation on images in: {args.segment_dir}")
         
         # Create segmentation dataset
         segment_dataset = OCTSegmentationDataset(
@@ -690,7 +718,8 @@ if __name__ == '__main__':
             args.image_size,
             transform=val_test_transform
         )
-        # Add this custom collate function before your DataLoader creation
+        
+        # Custom collate function to handle original sizes as tuples
         def custom_collate(batch):
             images = torch.stack([item[0] for item in batch])
             filenames = [item[1] for item in batch]
@@ -704,8 +733,7 @@ if __name__ == '__main__':
             shuffle=False, 
             num_workers=2, 
             pin_memory=True,
-            collate_fn=custom_collate  # <<< ADD THIS
-
+            collate_fn=custom_collate
         )
         
         # Load model weights
@@ -728,50 +756,50 @@ if __name__ == '__main__':
         
         model.eval()
         
-        all_images = []
+        # CRITICAL FIX: Only collect necessary data (no image tensors)
         all_filenames = []
         all_original_sizes = []
         all_predicted_masks = []
         
-        print(f"Processing {len(segment_dataset)} images...")
+        print(f"⚙️ Processing {len(segment_dataset)} images...")
         with torch.no_grad():
             for batch_idx, (images, filenames, original_sizes) in enumerate(segment_loader):
                 images = images.to(device)
                 outputs = model(images)
                 predicted_masks = torch.sigmoid(outputs)
                 
-                all_images.append(images.cpu())
+                # Collect only what we need for saving
                 all_filenames.extend(filenames)
                 all_original_sizes.extend(original_sizes)
                 all_predicted_masks.append(predicted_masks.cpu())
                 
-                print(f"Processed batch {batch_idx + 1}/{len(segment_loader)}")
+                print(f"✅ Processed batch {batch_idx + 1}/{len(segment_loader)} ({len(filenames)} images)")
         
-        # Concatenate all batches
-        all_images = torch.cat(all_images, dim=0)
+        # Concatenate all batches of masks
         all_predicted_masks = torch.cat(all_predicted_masks, dim=0)
         
-        # Save results
+        # Save results using ORIGINAL images from disk
         save_segmentation_results(
-            all_images, 
             all_filenames, 
             all_original_sizes, 
             all_predicted_masks, 
             args.output_dir, 
+            args.segment_dir,  # Pass original image directory
             args.save_overlay, 
             args.threshold
         )
         
-        print(f"✅ Segmentation completed! Results saved to {args.output_dir}")
-        print(f"   - Masks saved to: {os.path.join(args.output_dir, 'masks')}")
+        print(f"\n🎉 Segmentation completed successfully!")
+        print(f"   ► Results saved to: {args.output_dir}")
+        print(f"   ► Masks directory: {os.path.join(args.output_dir, 'masks')}")
         if args.save_overlay:
-            print(f"   - Overlays saved to: {os.path.join(args.output_dir, 'overlays')}")
+            print(f"   ► Overlays directory: {os.path.join(args.output_dir, 'overlays')}")
         sys.exit(0)
-
 
     # ===== TRAINING MODE =====
     assert args.image_dir and args.mask_dir, (
-        '--image_dir and --mask_dir are required for training'
+        '❌ --image_dir and --mask_dir are required for training. '
+        'Use --segment_dir for inference without masks.'
     )
     
     # Load pre-trained weights if specified
@@ -811,11 +839,11 @@ if __name__ == '__main__':
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     
-    print(f"📊 Dataset Info:")
-    print(f"   Training samples: {len(train_dataset)}")
-    print(f"   Validation samples: {len(valid_dataset)}")
-    print(f"   Test samples: {len(test_dataset)}")
-    print(f"   Starting training for {args.num_epochs} epochs...")
+    print(f"\n📊 Dataset Information:")
+    print(f"   • Training samples: {len(train_dataset)}")
+    print(f"   • Validation samples: {len(valid_dataset)}")
+    print(f"   • Test samples: {len(test_dataset)}")
+    print(f"   • Starting training for {args.num_epochs} epochs...")
     
     # Train the model
     dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
@@ -823,10 +851,10 @@ if __name__ == '__main__':
     )
     
     # Print final results
-    print(f"\n🎯 Final Validation Results:")
-    print(f"   Dice (Combined): {dice_combined:.4f}")
-    print(f"   Dice (Choroid): {dice_choroid:.4f}")
-    print(f"   Upper Signed Error: {upper_signed:.2f} μm")
-    print(f"   Upper Unsigned Error: {upper_unsigned:.2f} μm")
-    print(f"   Lower Signed Error: {lower_signed:.2f} μm")
-    print(f"   Lower Unsigned Error: {lower_unsigned:.2f} μm")
+    print(f"\n🏁 Final Validation Results:")
+    print(f"   • Dice (Combined): {dice_combined:.4f}")
+    print(f"   • Dice (Choroid): {dice_choroid:.4f}")
+    print(f"   • Upper Boundary Signed Error: {upper_signed:.2f} μm")
+    print(f"   • Upper Boundary Unsigned Error: {upper_unsigned:.2f} μm")
+    print(f"   • Lower Boundary Signed Error: {lower_signed:.2f} μm")
+    print(f"   • Lower Boundary Unsigned Error: {lower_unsigned:.2f} μm")
