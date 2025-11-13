@@ -22,7 +22,7 @@
 
 RFA-U-Net/
 ├── src/
-│   ├── rfa-u-net.py          # Main train/infer script
+│   ├── rfa_u_net.py          # Main train/infer script
 │   ├── models\_vit.py         # RETFound ViT implementation
 │   └── util/
 │       └── pos\_embed.py      # Positional embedding utils
@@ -98,7 +98,7 @@ data/
 Evaluate pre-trained RFA-U-Net on your own data (no training):
 
 ```bash
-python src/rfa-u-net.py \
+python src/rfa_u_net.py \
   --test_only \
   --test_image_dir path/to/images \
   --test_mask_dir  path/to/masks \
@@ -126,7 +126,7 @@ Lower signed/unsigned error:  1.12/20.50 μm
 ### 1. From scratch (no pre-training)
 
 ```bash
-python src/rfa-u-net.py \
+python src/rfa_u_net.py \
   --image_dir data/images \
   --mask_dir  data/masks \
   --weights_type none \
@@ -137,7 +137,7 @@ python src/rfa-u-net.py \
 ### 2. Fine-tune with RETFound
 
 ```bash
-python src/rfa-u-net.py \
+python src/rfa_u_net.py \
   --image_dir data/images \
   --mask_dir  data/masks \
   --weights_type retfound \
@@ -150,7 +150,7 @@ python src/rfa-u-net.py \
 (Default downloads via gdown if not present)
 
 ```bash
-python src/rfa-u-net.py \
+python src/rfa_u_net.py \
   --image_dir data/images \
   --mask_dir  data/masks \
   --weights_type rfa-unet \
