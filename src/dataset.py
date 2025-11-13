@@ -69,33 +69,3 @@ class OCTDataset(torch.utils.data.Dataset):
 
         return image, mask_onehot
 
-class OCTSegmentationDataset(torch.utils.data.Dataset):
-    def __init__(self, image_dir, image_size, transform=None):
-        self.image_size = image_size
-        self.transform = transform
-        
-        # Supported extensions
-        exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-        
-        # Build list of image paths
-        self.image_paths = []
-        for fname in os.listdir(image_dir):
-            _, ext = os.path.splitext(fname)
-            if ext.lower() in exts:
-                self.image_paths.append(os.path.join(image_dir, fname))
-        
-        # Sort for consistent ordering
-        self.image_paths = sorted(self.image_paths)
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('RGB')
-        original_size = image.size  # Store original size for saving results
-        
-        if self.transform:
-            image = self.transform(image)
-            
-        return image, os.path.basename(img_path), original_size
