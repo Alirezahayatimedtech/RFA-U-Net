@@ -630,11 +630,94 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AttentionUNetViT(config).to(device)
-    for i, blk in enumerate(model.encoder.blocks):
-        if i < 23:
-            for p in blk.parameters():
-                p.requires_grad = False
+    
+    # Freeze early layers if using pre-trained weights
+    if args.weights_type in ['retfound', 'rfa-unet']:
+        for i, blk in enumerate(model.encoder.blocks):
+            if i < 23:
+                for p in blk.parameters():
+                    p.requires_grad = False
 
+    # ===== SEGMENTATION MODE (No masks needed) =====
+    if args.segment_dir:
+        print(f"Running segmentation on images in: {args.segment_dir}")
+        
+        # Create segmentation dataset
+        segment_dataset = OCTSegmentationDataset(
+            args.segment_dir,
+            args.image_size,
+            transform=val_test_transform
+        )
+        
+        segment_loader = DataLoader(
+            segment_dataset, 
+            batch_size=args.batch_size,
+            shuffle=False, 
+            num_workers=2, 
+            pin_memory=True
+        )
+        
+        # Load model weights
+        if os.path.exists(config['retfound_weights_path']):
+            checkpoint = torch.load(config['retfound_weights_path'], map_location=device, weights_only=False)
+            
+            # Extract model state dict
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                state_dict = checkpoint
+                
+            model.load_state_dict(state_dict, strict=False)
+            print(f"✅ Loaded weights from {config['retfound_weights_path']}")
+        else:
+            print(f"❌ Error: Weight file not found at {config['retfound_weights_path']}")
+            sys.exit(1)
+        
+        model.eval()
+        
+        all_images = []
+        all_filenames = []
+        all_original_sizes = []
+        all_predicted_masks = []
+        
+        print(f"Processing {len(segment_dataset)} images...")
+        with torch.no_grad():
+            for batch_idx, (images, filenames, original_sizes) in enumerate(segment_loader):
+                images = images.to(device)
+                outputs = model(images)
+                predicted_masks = torch.sigmoid(outputs)
+                
+                all_images.append(images.cpu())
+                all_filenames.extend(filenames)
+                all_original_sizes.extend(original_sizes)
+                all_predicted_masks.append(predicted_masks.cpu())
+                
+                print(f"Processed batch {batch_idx + 1}/{len(segment_loader)}")
+        
+        # Concatenate all batches
+        all_images = torch.cat(all_images, dim=0)
+        all_predicted_masks = torch.cat(all_predicted_masks, dim=0)
+        
+        # Save results
+        save_segmentation_results(
+            all_images, 
+            all_filenames, 
+            all_original_sizes, 
+            all_predicted_masks, 
+            args.output_dir, 
+            args.save_overlay, 
+            args.threshold
+        )
+        
+        print(f"✅ Segmentation completed! Results saved to {args.output_dir}")
+        print(f"   - Masks saved to: {os.path.join(args.output_dir, 'masks')}")
+        if args.save_overlay:
+            print(f"   - Overlays saved to: {os.path.join(args.output_dir, 'overlays')}")
+        sys.exit(0)
+
+    # ===== TEST-ONLY MODE (With ground truth masks) =====
     if args.test_only:
         assert args.test_image_dir and args.test_mask_dir, (
             '--test_only requires --test_image_dir and --test_mask_dir'
@@ -644,39 +727,43 @@ if __name__ == '__main__':
             args.test_mask_dir,           # mask_dir
             args.image_size,              # image_size 
             transform=val_test_transform,
-            num_classes=2# transform
-
+            num_classes=2
         )
         test_loader = DataLoader(
             test_ds, batch_size=args.batch_size,
             shuffle=False, num_workers=2, pin_memory=True
         )
-        # load the full checkpoint (may include optimizer, epoch, etc.)
-        raw_ckpt = torch.load(
-            config['retfound_weights_path'],
-            map_location=device,
-            weights_only=False
-        )
-        print("Test-only checkpoint keys:", list(raw_ckpt.keys()))
+        
+        # Load the full checkpoint
+        if os.path.exists(config['retfound_weights_path']):
+            raw_ckpt = torch.load(
+                config['retfound_weights_path'],
+                map_location=device,
+                weights_only=False
+            )
+            print("Test-only checkpoint keys:", list(raw_ckpt.keys()))
 
-        # pick out the model weights dict
-        if 'model_state_dict' in raw_ckpt:
-            sd = raw_ckpt['model_state_dict']
-        elif 'model' in raw_ckpt:
-            sd = raw_ckpt['model']
+            # Pick out the model weights dict
+            if 'model_state_dict' in raw_ckpt:
+                sd = raw_ckpt['model_state_dict']
+            elif 'model' in raw_ckpt:
+                sd = raw_ckpt['model']
+            else:
+                sd = raw_ckpt
+
+            # Load with strict=False so missing head/decoder weights are OK
+            model.load_state_dict(sd, strict=False)
+            print("✅ Model weights loaded successfully")
         else:
-            sd = raw_ckpt
-
-        # load with strict=False so missing head/decoder weights are OK
-        model.load_state_dict(sd, strict=False)
+            print(f"❌ Error: Weight file not found at {config['retfound_weights_path']}")
+            sys.exit(1)
+            
         model.eval()
         all_dice, all_upper, all_lower = [], [], []
         with torch.no_grad():
             for imgs, msks in test_loader:
                 imgs, msks = imgs.to(device), msks.to(device)
                 outs = model(imgs)
-                #print(f"Output shape: {outs.shape}, Min: {outs.min().item()}, Max: {outs.max().item()}")
-                #print(f"Sigmoid output min/max: {torch.sigmoid(outs).min().item()}/{torch.sigmoid(outs).max().item()}")
                 _, dch = dice_score(outs, msks)
                 all_dice.append(dch)
                 preds = torch.sigmoid(outs).cpu().numpy()
@@ -690,40 +777,75 @@ if __name__ == '__main__':
                     ls, lu = compute_errors(pl, gl, args.pixel_size_micrometers)
                     all_upper.append((us, uu))
                     all_lower.append((ls, lu))
-        print(f"Choroid Dice on external data: {np.mean(all_dice):.4f}")
+        
+        print(f"\n📊 Evaluation Results on External Data:")
+        print(f"   Choroid Dice: {np.mean(all_dice):.4f}")
         usm = np.mean([u for u,_ in all_upper])
         uum = np.mean([u for _,u in all_upper])
         lsm = np.mean([l for l,_ in all_lower])
         lum = np.mean([l for _,l in all_lower])
-        print(f"Upper signed/unsigned error: {usm:.2f}/{uum:.2f} μm")
-        print(f"Lower signed/unsigned error: {lsm:.2f}/{lum:.2f} μm")
+        print(f"   Upper signed/unsigned error: {usm:.2f}/{uum:.2f} μm")
+        print(f"   Lower signed/unsigned error: {lsm:.2f}/{lum:.2f} μm")
         sys.exit(0)
 
-    # Training logic (if not test_only)
+    # ===== TRAINING MODE =====
     assert args.image_dir and args.mask_dir, (
         '--image_dir and --mask_dir are required for training'
     )
+    
+    # Load pre-trained weights if specified
     if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
-        checkpoint = torch.load(config["retfound_weights_path"], map_location=device ,     weights_only=False)
-        model.load_state_dict(checkpoint, strict=False)
-        print(f"Loaded weights from {config['retfound_weights_path']}")
+        checkpoint = torch.load(config["retfound_weights_path"], map_location=device, weights_only=False)
+        
+        # Extract model state dict
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+            
+        model.load_state_dict(state_dict, strict=False)
+        print(f"✅ Loaded weights from {config['retfound_weights_path']}")
+    
+    # Setup training components
     criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     scaler = GradScaler('cuda')
-    full_dataset = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=val_test_transform,  num_classes=2 )
+    
+    # Prepare datasets
+    full_dataset = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
     valid_size = int(0.15 * len(full_dataset))
     test_size = len(full_dataset) - train_size - valid_size
     train_dataset, valid_dataset, test_dataset = random_split(full_dataset, [train_size, valid_size, test_size])
+    
+    # Apply transforms
     train_dataset.dataset.transform = train_transform
     valid_dataset.dataset.transform = val_test_transform
     test_dataset.dataset.transform = val_test_transform
+    
+    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    
+    print(f"📊 Dataset Info:")
+    print(f"   Training samples: {len(train_dataset)}")
+    print(f"   Validation samples: {len(valid_dataset)}")
+    print(f"   Test samples: {len(test_dataset)}")
+    print(f"   Starting training for {args.num_epochs} epochs...")
+    
+    # Train the model
     dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
         train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold
     )
-    print(f"Validation Dice (Combined): {dice_combined:.4f}, Validation Dice (Choroid): {dice_choroid:.4f}, "
-          f"Upper Signed Error: {upper_signed:.2f} μm, Upper Unsigned Error: {upper_unsigned:.2f} μm, "
-          f"Lower Signed Error: {lower_signed:.2f} μm, Lower Unsigned Error: {lower_unsigned:.2f} μm")
+    
+    # Print final results
+    print(f"\n🎯 Final Validation Results:")
+    print(f"   Dice (Combined): {dice_combined:.4f}")
+    print(f"   Dice (Choroid): {dice_choroid:.4f}")
+    print(f"   Upper Signed Error: {upper_signed:.2f} μm")
+    print(f"   Upper Unsigned Error: {upper_unsigned:.2f} μm")
+    print(f"   Lower Signed Error: {lower_signed:.2f} μm")
+    print(f"   Lower Unsigned Error: {lower_unsigned:.2f} μm")
