@@ -60,10 +60,12 @@ def parse_args():
     parser.add_argument('--test_only', action='store_true', help='Run inference on external data without training')
     parser.add_argument('--test_image_dir', type=str, default=None, help='Path to external test images (required if --test_only)')
     parser.add_argument('--test_mask_dir', type=str, default=None, help='Path to external test masks (required if --test_only)')
+    parser.add_argument('--segment_dir', type=str, default=None, help='Path to directory containing images to segment (no masks needed)')
+    parser.add_argument('--output_dir', type=str, default='segment_results', help='Directory to save segmentation results')
+    parser.add_argument('--save_overlay', action='store_true', help='Save overlay images with segmentation boundaries')
     parser.add_argument('--pixel_size_micrometers', type=float, default=10.35, help='Pixel size in micrometers for boundary error computation')
     parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binarizing predicted masks')
     return parser.parse_args()
-
 # Parse arguments
 args = parse_args()
 
