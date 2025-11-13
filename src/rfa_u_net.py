@@ -234,7 +234,8 @@ class AttentionUNetViT(nn.Module):
 
             # 4) move tensors to GPU if available
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            state_dict = {k: v.to(device) for k, v in state_dict.items()}
+            state_dict = {k: v.to(device) if torch.is_tensor(v) else v for k, v in state_dict.items()}
+
 
             if args.weights_type == 'retfound':
                 # remove incompatible keys, interpolate positional embeddings
