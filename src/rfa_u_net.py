@@ -22,11 +22,41 @@ from timm.layers import drop_path, to_2tuple, trunc_normal_
 import models_vit
 from util.pos_embed import interpolate_pos_embed
 import argparse
-import gdown
 import sys
+import csv
+from datetime import datetime
+try:
+    import gdown
+except Exception:
+    gdown = None
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from dataset import OCTDataset
+
+
+ABLATION_PRESETS = {
+    "baseline": {"use_attention": False, "use_fusion": False, "use_upconvs": False},
+    "attention_only": {"use_attention": True, "use_fusion": False, "use_upconvs": False},
+    "fusion_only": {"use_attention": False, "use_fusion": True, "use_upconvs": False},
+    "upconvs_only": {"use_attention": False, "use_fusion": False, "use_upconvs": True},
+    "attention_fusion": {"use_attention": True, "use_fusion": True, "use_upconvs": False},
+    "attention_upconvs": {"use_attention": True, "use_fusion": False, "use_upconvs": True},
+    "fusion_upconvs": {"use_attention": False, "use_fusion": True, "use_upconvs": True},
+    "full": {"use_attention": True, "use_fusion": True, "use_upconvs": True},
+}
+
+
+def resolve_ablation_flags(preset: str):
+    if preset not in ABLATION_PRESETS:
+        raise ValueError(f"Unknown ablation preset '{preset}'. Valid: {list(ABLATION_PRESETS.keys())}")
+    return ABLATION_PRESETS[preset]
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 
@@ -65,18 +95,43 @@ def parse_args():
     parser.add_argument('--save_overlay', action='store_true', help='Save overlay images with segmentation boundaries')
     parser.add_argument('--pixel_size_micrometers', type=float, default=10.35, help='Pixel size in micrometers for boundary error computation')
     parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binarizing predicted masks')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible data split')
+    parser.add_argument('--ablation_preset', type=str, default='full', choices=list(ABLATION_PRESETS.keys()),
+                        help='Ablation preset for decoder: baseline/attention/fusion/up-convs combinations')
+    parser.add_argument('--list_ablation_presets', action='store_true',
+                        help='List all ablation presets and exit')
+    parser.add_argument('--save_best_path', type=str, default=None,
+                        help='Best-checkpoint path (default: weights/best_rfa_unet_<ablation>.pth)')
+    parser.add_argument('--ablation_results_csv', type=str, default=None,
+                        help='Optional CSV path to append final ablation metrics')
     return parser.parse_args()
 # Parse arguments
 args = parse_args()
 
+if args.list_ablation_presets:
+    print("Available ablation presets:")
+    for preset_name, preset_flags in ABLATION_PRESETS.items():
+        print(
+            f"  - {preset_name}: "
+            f"attention={preset_flags['use_attention']}, "
+            f"fusion={preset_flags['use_fusion']}, "
+            f"upconvs={preset_flags['use_upconvs']}"
+        )
+    sys.exit(0)
+
 # Configuration based on command-line arguments
+ablation_flags = resolve_ablation_flags(args.ablation_preset)
 config = {
     "image_size": args.image_size,
     "hidden_dim": 1024,
     "patch_size": 16,
     "num_channels": 3,
     "num_classes": 2,
-    "retfound_weights_path": args.weights_path
+    "retfound_weights_path": args.weights_path,
+    "ablation_preset": args.ablation_preset,
+    "use_attention": ablation_flags["use_attention"],
+    "use_fusion": ablation_flags["use_fusion"],
+    "use_upconvs": ablation_flags["use_upconvs"],
 }
 
 # Weights file paths
@@ -91,6 +146,8 @@ RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1zDEdAmNw
 def download_weights(weights_path, url):
     if not os.path.exists(weights_path):
         print(f"Weights file not found at {weights_path}. Downloading...")
+        if gdown is None:
+            raise ImportError("gdown is required to download RFA-U-Net weights from Google Drive. Install it with `pip install gdown`.")
         os.makedirs(os.path.dirname(weights_path), exist_ok=True)
         gdown.download(url, weights_path, quiet=False)
         print(f"Weights downloaded to {weights_path}")
@@ -171,24 +228,44 @@ class AttentionGate(nn.Module):
             s = nn.functional.interpolate(s, size=out.shape[-2:], mode='bilinear', align_corners=True)
         return out * s
 
-# Decoder block with attention
+# Decoder block with ablation toggles
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, reduce_skip=True):
+    def __init__(self, in_c, out_c, use_attention=True, use_fusion=True, use_upconvs=True, reduce_skip=True):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.reduce_channels_x = nn.Conv2d(in_c[0], out_c, kernel_size=1)
+        self.use_attention = use_attention
+        self.use_fusion = use_fusion
+        self.use_upconvs = use_upconvs
+
+        if self.use_upconvs:
+            self.up = nn.ConvTranspose2d(in_c[0], out_c, kernel_size=2, stride=2)
+            self.reduce_channels_x = nn.Identity()
+        else:
+            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+            self.reduce_channels_x = nn.Conv2d(in_c[0], out_c, kernel_size=1)
+
         self.reduce_channels_s = nn.Conv2d(in_c[1], out_c, kernel_size=1) if reduce_skip else nn.Identity()
-        self.ag = AttentionGate([out_c, out_c], out_c)
-        self.c1 = ConvBlock(out_c + out_c, out_c)
+        self.ag = AttentionGate([out_c, out_c], out_c) if self.use_attention else nn.Identity()
+        self.c_fusion = ConvBlock(out_c + out_c, out_c)
+        self.c_plain = ConvBlock(out_c, out_c)
 
     def forward(self, x, s):
         x = self.up(x)
         x = self.reduce_channels_x(x)
         s = self.reduce_channels_s(s)
-        s = self.ag(x, s)
-        x = torch.cat([x, s], axis=1)
-        x = self.c1(x)
-        return x
+
+        if x.shape[-2:] != s.shape[-2:]:
+            s = F.interpolate(s, size=x.shape[-2:], mode='bilinear', align_corners=True)
+
+        if self.use_attention:
+            s = self.ag(x, s)
+
+        if self.use_fusion:
+            x = torch.cat([x, s], dim=1)
+            return self.c_fusion(x)
+
+        if self.use_attention:
+            x = x + s
+        return self.c_plain(x)
 
 # Main RFA-U-Net model
 class AttentionUNetViT(nn.Module):
@@ -254,11 +331,14 @@ class AttentionUNetViT(nn.Module):
                 print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
 
 
-        # Decoder blocks
-        self.d1 = DecoderBlock([1024, 1024], 512)
-        self.d2 = DecoderBlock([512, 1024], 256)
-        self.d3 = DecoderBlock([256, 1024], 128)
-        self.d4 = DecoderBlock([128, 1024], 64)
+        # Decoder blocks with ablation switches
+        use_attention = config.get("use_attention", True)
+        use_fusion = config.get("use_fusion", True)
+        use_upconvs = config.get("use_upconvs", True)
+        self.d1 = DecoderBlock([1024, 1024], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+        self.d2 = DecoderBlock([512, 1024], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+        self.d3 = DecoderBlock([256, 1024], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+        self.d4 = DecoderBlock([128, 1024], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
         self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1, padding=0)
 
     def forward(self, x):
@@ -568,8 +648,20 @@ def find_boundaries(mask):
             
     return upper_boundaries, lower_boundaries
 
-# Training and Evaluation Functions (unchanged from original)
-def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimizer, device, num_epochs, scaler, threshold):
+# Training and Evaluation Functions
+def train_fold(
+    train_loader,
+    valid_loader,
+    test_loader,
+    model,
+    criterion,
+    optimizer,
+    device,
+    num_epochs,
+    scaler,
+    threshold,
+    save_best_path,
+):
     # track best validation choroid-dice
     best_choroid = -1.0
 
@@ -621,9 +713,9 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
                 'scaler_state_dict': scaler.state_dict(),
                 'val_choroid_dice': best_choroid
             }
-            os.makedirs("weights", exist_ok=True)
-            torch.save(ckpt, "weights/best_rfa_unet.pth")
-            print(f"💾 New best checkpoint saved: weights/best_rfa_unet.pth")
+            os.makedirs(os.path.dirname(save_best_path) or ".", exist_ok=True)
+            torch.save(ckpt, save_best_path)
+            print(f"💾 New best checkpoint saved: {save_best_path}")
 
     # — after all epochs, run full evaluation on validation & test sets as before —
 
@@ -669,6 +761,32 @@ def train_fold(train_loader, valid_loader, test_loader, model, criterion, optimi
 
     return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
 
+
+def append_ablation_results(csv_path, preset, save_best_path, metrics):
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    file_exists = os.path.exists(csv_path)
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ablation_preset": preset,
+        "use_attention": int(ABLATION_PRESETS[preset]["use_attention"]),
+        "use_fusion": int(ABLATION_PRESETS[preset]["use_fusion"]),
+        "use_upconvs": int(ABLATION_PRESETS[preset]["use_upconvs"]),
+        "best_checkpoint": save_best_path,
+        "dice_combined": float(metrics[0]),
+        "dice_choroid": float(metrics[1]),
+        "upper_signed_um": float(metrics[2]),
+        "upper_unsigned_um": float(metrics[3]),
+        "lower_signed_um": float(metrics[4]),
+        "lower_unsigned_um": float(metrics[5]),
+    }
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"📝 Ablation metrics appended to: {csv_path}")
+
+
 class OCTSegmentationDataset(torch.utils.data.Dataset):
     def __init__(self, image_dir, image_size, transform=None):
         self.image_size = image_size
@@ -696,8 +814,13 @@ class OCTSegmentationDataset(torch.utils.data.Dataset):
         return image, os.path.basename(img_path), original_size
 
 if __name__ == '__main__':
+    set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device}")
+    print(
+        f"🧪 Ablation preset: {config['ablation_preset']} | "
+        f"attention={config['use_attention']} fusion={config['use_fusion']} upconvs={config['use_upconvs']}"
+    )
     
     model = AttentionUNetViT(config).to(device)
     
@@ -821,13 +944,19 @@ if __name__ == '__main__':
     criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
     scaler = GradScaler('cuda')
+    save_best_path = args.save_best_path or os.path.join("weights", f"best_rfa_unet_{args.ablation_preset}.pth")
     
     # Prepare datasets
     full_dataset = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=val_test_transform, num_classes=2)
     train_size = int(0.7 * len(full_dataset))
     valid_size = int(0.15 * len(full_dataset))
     test_size = len(full_dataset) - train_size - valid_size
-    train_dataset, valid_dataset, test_dataset = random_split(full_dataset, [train_size, valid_size, test_size])
+    split_generator = torch.Generator().manual_seed(args.seed)
+    train_dataset, valid_dataset, test_dataset = random_split(
+        full_dataset,
+        [train_size, valid_size, test_size],
+        generator=split_generator,
+    )
     
     # Apply transforms
     train_dataset.dataset.transform = train_transform
@@ -843,11 +972,12 @@ if __name__ == '__main__':
     print(f"   • Training samples: {len(train_dataset)}")
     print(f"   • Validation samples: {len(valid_dataset)}")
     print(f"   • Test samples: {len(test_dataset)}")
+    print(f"   • Best checkpoint path: {save_best_path}")
     print(f"   • Starting training for {args.num_epochs} epochs...")
     
     # Train the model
     dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
-        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold
+        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold, save_best_path
     )
     
     # Print final results
@@ -858,3 +988,11 @@ if __name__ == '__main__':
     print(f"   • Upper Boundary Unsigned Error: {upper_unsigned:.2f} μm")
     print(f"   • Lower Boundary Signed Error: {lower_signed:.2f} μm")
     print(f"   • Lower Boundary Unsigned Error: {lower_unsigned:.2f} μm")
+
+    if args.ablation_results_csv:
+        append_ablation_results(
+            csv_path=args.ablation_results_csv,
+            preset=args.ablation_preset,
+            save_best_path=save_best_path,
+            metrics=(dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned),
+        )
