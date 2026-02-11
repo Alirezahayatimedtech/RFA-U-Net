@@ -6,6 +6,7 @@
 🆕 New:
 * **Segmentation-only mode** for unlabeled OCT images via `--segment_dir` (no masks needed)
 * **Unified CNN/SOTA training and evaluation runner** via `src/cnn_sota_unet_models.py`
+* **RFA-U-Net ablation-study presets** in `src/rfa_u_net.py` via `--ablation_preset`
 
 ---
 
@@ -23,6 +24,11 @@
 
   * Run on **unlabeled OCT images** using `--segment_dir`
   * Saves **binary masks** and optional **boundary overlays** to disk
+* **🆕 Ablation protocol support**:
+
+  * Toggle decoder components with predefined presets
+  * Save per-ablation best checkpoints automatically
+  * Optionally append metrics to a CSV for study reporting
 
 ---
 
@@ -178,6 +184,66 @@ python src/rfa_u_net.py \
   --num_epochs 15 \
   --batch_size 8
 ```
+
+---
+
+## 🧪 RFA-U-Net Ablation Study Protocol
+
+`src/rfa_u_net.py` now supports fixed ablation presets that isolate decoder components:
+
+* `baseline` (plain decoder)
+* `attention_only`
+* `fusion_only`
+* `upconvs_only`
+* `attention_fusion`
+* `attention_upconvs`
+* `fusion_upconvs`
+* `full` (attention + fusion + up-convs)
+
+List available presets:
+
+```bash
+python src/rfa_u_net.py --list_ablation_presets
+```
+
+Run one ablation:
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir data/masks \
+  --weights_type retfound \
+  --ablation_preset attention_fusion \
+  --num_epochs 150 \
+  --batch_size 8 \
+  --seed 42 \
+  --save_best_path weights/best_rfa_unet_attention_fusion.pth \
+  --ablation_results_csv runs/ablation_results.csv
+```
+
+Run the full 8-preset sweep:
+
+```bash
+for p in baseline attention_only fusion_only upconvs_only attention_fusion attention_upconvs fusion_upconvs full; do
+  python src/rfa_u_net.py \
+    --image_dir data/images \
+    --mask_dir data/masks \
+    --weights_type retfound \
+    --ablation_preset "$p" \
+    --num_epochs 150 \
+    --batch_size 8 \
+    --seed 42 \
+    --save_best_path "weights/best_rfa_unet_${p}.pth" \
+    --ablation_results_csv runs/ablation_results.csv
+done
+```
+
+Useful ablation flags:
+
+* `--ablation_preset`: choose one of the 8 presets
+* `--save_best_path`: set preset-specific checkpoint path
+* `--ablation_results_csv`: append final metrics row per run
+* `--seed`: fixed split seed for reproducible comparisons
 
 ---
 
@@ -396,6 +462,11 @@ Segmentation-only mode also creates overlay PNGs directly from your unlabeled OC
 * **2026-02-11**
 
   * Added `src/cnn_sota_unet_models.py` for unified CNN + SOTA training/evaluation/prediction
+  * Added RFA-U-Net ablation protocol in `src/rfa_u_net.py`:
+    * `--ablation_preset` with 8 predefined component combinations
+    * `--list_ablation_presets` for quick preset discovery
+    * `--save_best_path` for per-ablation checkpoint management
+    * `--ablation_results_csv` to append comparable ablation metrics
   * Added model registry for 7 CNN-U-Net baselines + 3 SOTA models
   * Added notebook-aligned preprocessing profiles per model
   * Added configurable metric area support:
