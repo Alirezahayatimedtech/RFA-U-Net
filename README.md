@@ -2,8 +2,10 @@
 
 **RFA-U-Net** is a deep learning model to segment the **choroid** in Optical Coherence Tomography (OCT) images. It uses a **RETFound**-pretrained Vision Transformer (ViT) encoder and an **Attention U-Net** decoder, trained with Tversky/Dice losses and evaluated via Dice scores and micrometer-scale boundary errors.
 
-**Last updated: 2025-11-13**
-🆕 New: **Segmentation-only mode** for unlabeled OCT images via `--segment_dir` (no masks needed).
+**Last updated: 2026-02-11**
+🆕 New:
+* **Segmentation-only mode** for unlabeled OCT images via `--segment_dir` (no masks needed)
+* **Unified CNN/SOTA training and evaluation runner** via `src/cnn_sota_unet_models.py`
 
 ---
 
@@ -30,6 +32,7 @@
 RFA-U-Net/
 ├── src/
 │   ├── rfa_u_net.py          # Main train / infer / segment-only script
+│   ├── cnn_sota_unet_models.py # Unified runner for CNN + SOTA U-Net baselines
 │   ├── models_vit.py         # RETFound ViT implementation
 │   └── util/
 │       └── pos_embed.py      # Positional embedding utils
@@ -178,6 +181,118 @@ python src/rfa_u_net.py \
 
 ---
 
+## 🆕 Unified CNN + SOTA U-Net Runner
+
+This repository now includes `src/cnn_sota_unet_models.py`, a single CLI for:
+
+* training (`--mode train`)
+* evaluation (`--mode eval`)
+* prediction/export masks (`--mode predict`)
+
+across **7 CNN-U-Net baselines** + **3 SOTA models**:
+
+* `cnn_attention_unet_vit`
+* `cnn_inception_unet`
+* `cnn_alexnet_unet`
+* `cnn_unet_vgg16`
+* `cnn_unet_vgg19`
+* `cnn_unet_resnet50`
+* `cnn_unet_resnet101`
+* `sota_pgkd`
+* `sota_deepgpet`
+* `sota_unet_bem`
+
+### Key additions in this script
+
+* notebook-aligned preprocessing defaults by model (`--notebook-defaults`)
+* model-specific loss/metric defaults (`--loss auto`, `--metric-profile auto`)
+* checkpointing + resume
+* optional layer freezing for transfer learning
+* scheduler support (`none`, `plateau`, `step`)
+* multiple Dice/IoU evaluation areas:
+  * `--metric-area full`
+  * `--metric-area gt_choroid_columns`
+  * `--metric-area union_choroid_columns`
+
+### Important dependency note for SOTA models
+
+For `sota_pgkd`, `sota_deepgpet`, and `sota_unet_bem`, ensure required external repos/modules are importable (e.g., via `PYTHONPATH`) before running.
+
+### Quick usage
+
+List model IDs and defaults:
+
+```bash
+python src/cnn_sota_unet_models.py --list-models
+```
+
+Train a CNN baseline (example: ResNet50 U-Net):
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode train \
+  --model-id cnn_unet_resnet50 \
+  --image-dir data/train/training/images \
+  --mask-dir data/train/training/labels \
+  --output-dir runs/cnn_unet_resnet50 \
+  --epochs 150 \
+  --batch-size 8 \
+  --lr 1e-4 \
+  --loss weighted_ce \
+  --class-weights 1.0,2.0 \
+  --scheduler plateau \
+  --monitor dice \
+  --augment \
+  --notebook-defaults
+```
+
+Train DeepGPET:
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode train \
+  --model-id sota_deepgpet \
+  --image-dir data/train/training/images \
+  --mask-dir data/train/training/labels \
+  --output-dir runs/sota_deepgpet \
+  --epochs 150 \
+  --batch-size 4 \
+  --lr 1e-3 \
+  --loss bce_logits \
+  --scheduler plateau \
+  --monitor dice \
+  --augment \
+  --notebook-defaults
+```
+
+Evaluate on a labeled test set with strict union metric area:
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode eval \
+  --model-id sota_pgkd \
+  --image-dir data/train/test/images \
+  --mask-dir data/train/test/labels \
+  --checkpoint runs/sota_pgkd/sota_pgkd_best.pth \
+  --save-metrics-path runs/sota_pgkd/test_metrics.json \
+  --metric-area union_choroid_columns \
+  --notebook-defaults
+```
+
+Predict masks for unlabeled images:
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode predict \
+  --model-id cnn_inception_unet \
+  --predict-image-dir path/to/images \
+  --checkpoint runs/cnn_inception_unet/cnn_inception_unet_best.pth \
+  --output-dir runs/cnn_inception_unet/predict_out \
+  --notebook-defaults
+```
+
+---
+
 ## 🆕 Segmentation-Only Mode (No Masks Required)
 
 This mode runs **pure inference** on *unlabeled* OCT images: it loads a trained model and saves segmentation masks (and optional overlays) to disk.
@@ -277,6 +392,17 @@ Segmentation-only mode also creates overlay PNGs directly from your unlabeled OC
 ---
 
 ## 📝 Changelog
+
+* **2026-02-11**
+
+  * Added `src/cnn_sota_unet_models.py` for unified CNN + SOTA training/evaluation/prediction
+  * Added model registry for 7 CNN-U-Net baselines + 3 SOTA models
+  * Added notebook-aligned preprocessing profiles per model
+  * Added configurable metric area support:
+    * `full`
+    * `gt_choroid_columns`
+    * `union_choroid_columns`
+  * Added scheduler, layer-freezing, checkpoint resume, and CLI documentation in README
 
 * **2025-11-13**
 
