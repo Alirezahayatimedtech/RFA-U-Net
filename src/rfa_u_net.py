@@ -6,14 +6,27 @@ This script implements a Vision Transformer (ViT) encoder pre-trained with RETFo
 weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 """
 
+# # IMPROVEMENTS (2026-02)
+# # 1) MULTI-RES INPUT SUPPORT:
+# #    - ViT patch embedding input-size checks are now aligned to --image_size
+# #      (must be a multiple of 16), enabling runs such as 320x320.
+# # 2) STABLE DATA LOADING:
+# #    - Added --num_workers to avoid environment-specific multiprocessing failures.
+# # 3) TRAINING/ABLATION READINESS:
+# #    - Existing flags for progressive unfreezing, token-pyramid skips,
+# #      post-refine head, and edge-aware loss are preserved as first-class controls.
+
 import os
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
@@ -45,6 +58,16 @@ ABLATION_PRESETS = {
     "full": {"use_attention": True, "use_fusion": True, "use_upconvs": True},
 }
 
+# Controlled A/B reference (external-data-full, 439 images, run date: 2026-02-14).
+# Keep these as regression anchors when changing architecture/training defaults.
+CONTROLLED_AB_NOTES = [
+    "exp04_legacy_skip: best pretrained setting (dice=0.859447, jaccard=0.760354).",
+    "exp02_v4_with_imagenet_norm: tied best (dice=0.859437, jaccard=0.760989).",
+    "exp01_v4_baseline: reference baseline (dice=0.856934, jaccard=0.755490).",
+    "exp06_no_pretrain_control: no RETFound pretrain control (dice=0.824202, jaccard=0.708974).",
+    "Conclusion: RETFound pretraining gives a clear gain; most decoder flag swaps are small deltas.",
+]
+
 
 def resolve_ablation_flags(preset: str):
     if preset not in ABLATION_PRESETS:
@@ -58,6 +81,88 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+def parse_class_weights(raw: str, num_classes: int = 2):
+    vals = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    if len(vals) == 1:
+        vals = vals * num_classes
+    if len(vals) != num_classes:
+        raise ValueError(f"class_weights must provide {num_classes} values, got {len(vals)}")
+    return vals
+
+
+def parse_block_indices(spec: str, num_blocks: int):
+    """
+    Parse block index spec into sorted unique indices.
+    Examples:
+      all
+      18-23
+      0,1,4-7,23
+    """
+    text = (spec or "").strip().lower()
+    if text in {"all", "*"}:
+        return list(range(num_blocks))
+    if not text:
+        return []
+
+    out = set()
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            a = int(left.strip())
+            b = int(right.strip())
+            if a > b:
+                a, b = b, a
+            for i in range(a, b + 1):
+                if i < 0 or i >= num_blocks:
+                    raise ValueError(f"adapter block index {i} out of range [0, {num_blocks - 1}]")
+                out.add(i)
+        else:
+            i = int(token)
+            if i < 0 or i >= num_blocks:
+                raise ValueError(f"adapter block index {i} out of range [0, {num_blocks - 1}]")
+            out.add(i)
+    return sorted(out)
+
+
+def parse_unfreeze_schedule(spec: str):
+    """
+    Parse schedule string "epoch:freeze_blocks,epoch:freeze_blocks".
+    Example: "1:24,10:21,20:18"
+    """
+    text = (spec or "").strip()
+    if not text:
+        return []
+    schedule = []
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise ValueError(f"invalid progressive_unfreeze_schedule token '{token}', expected epoch:freeze_blocks")
+        ep_raw, fr_raw = token.split(":", 1)
+        ep = int(ep_raw.strip())
+        fr = int(fr_raw.strip())
+        if ep < 1:
+            raise ValueError(f"schedule epoch must be >=1, got {ep}")
+        if fr < 0:
+            raise ValueError(f"freeze block count must be >=0, got {fr}")
+        schedule.append((ep, fr))
+    schedule = sorted(schedule, key=lambda x: x[0])
+    return schedule
+
+
+def apply_encoder_freeze(model: nn.Module, freeze_blocks: int) -> None:
+    if not hasattr(model, "encoder") or not hasattr(model.encoder, "blocks"):
+        return
+    freeze_blocks = max(0, int(freeze_blocks))
+    for i, blk in enumerate(model.encoder.blocks):
+        req_grad = i >= freeze_blocks
+        for p in blk.parameters():
+            p.requires_grad = req_grad
 
 
 def download_retfound_weights_hf(repo_id: str, filename: str, cache_dir: str = "weights"):
@@ -80,6 +185,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
     parser.add_argument('--image_dir', type=str, required=False, help='Path to the directory containing OCT images (required for training)')
     parser.add_argument('--mask_dir', type=str, required=False, help='Path to the directory containing mask images (required for training)')
+    parser.add_argument('--val_image_dir', type=str, default=None, help='Optional validation-image directory for explicit fold-based training')
+    parser.add_argument('--val_mask_dir', type=str, default=None, help='Optional validation-mask directory for explicit fold-based training')
     parser.add_argument('--weights_path', type=str, default='weights/best_rfa_unet.pth',
                         help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
     parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
@@ -87,6 +194,7 @@ def parse_args():
     parser.add_argument('--image_size', type=int, default=224, help='Input image size')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
+    parser.add_argument('--num_workers', type=int, default=2, help='DataLoader worker count')
     parser.add_argument('--test_only', action='store_true', help='Run inference on external data without training')
     parser.add_argument('--test_image_dir', type=str, default=None, help='Path to external test images (required if --test_only)')
     parser.add_argument('--test_mask_dir', type=str, default=None, help='Path to external test masks (required if --test_only)')
@@ -104,9 +212,103 @@ def parse_args():
                         help='Best-checkpoint path (default: weights/best_rfa_unet_<ablation>.pth)')
     parser.add_argument('--ablation_results_csv', type=str, default=None,
                         help='Optional CSV path to append final ablation metrics')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
+                        help='Optimizer type')
+    parser.add_argument('--weight_decay', type=float, default=0.0,
+                        help='Weight decay (L2 regularization)')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='Gradient clipping max-norm (<=0 disables)')
+    parser.add_argument('--freeze_encoder_blocks', type=int, default=21,
+                        help='Freeze first N ViT encoder blocks when using pretrained weights')
+    parser.add_argument('--progressive_unfreeze_schedule', type=str, default='',
+                        help='Optional schedule to change frozen block count by epoch, e.g. "1:24,10:21,20:18"')
+    parser.add_argument('--enable_encoder_adapters', action='store_true',
+                        help='Enable bottleneck adapters on selected ViT encoder blocks')
+    parser.add_argument('--adapter_rank', type=int, default=64,
+                        help='Bottleneck rank for encoder adapters (used when --enable_encoder_adapters)')
+    parser.add_argument('--adapter_blocks', type=str, default='all',
+                        help='Encoder blocks to attach adapters to (e.g., all or 18-23)')
+    parser.add_argument('--adapter_dropout', type=float, default=0.0,
+                        help='Dropout in encoder adapters')
+    parser.add_argument('--adapter_init_scale', type=float, default=1e-3,
+                        help='Initial residual scale for adapter output')
+    parser.add_argument('--early_stopping_patience', type=int, default=8,
+                        help='Early stopping patience on validation choroid Dice (<=0 disables)')
+    parser.add_argument('--early_stopping_min_delta', type=float, default=1e-4,
+                        help='Minimum choroid Dice improvement to reset early stopping')
+    parser.add_argument('--scheduler', type=str, default='plateau', choices=['none', 'plateau'],
+                        help='LR scheduler')
+    parser.add_argument('--scheduler_factor', type=float, default=0.5,
+                        help='ReduceLROnPlateau factor')
+    parser.add_argument('--scheduler_patience', type=int, default=5,
+                        help='ReduceLROnPlateau patience')
+    parser.add_argument('--class_weights', type=str, default='1.0,2.0',
+                        help='Comma-separated class weights used in Tversky loss (e.g. 1.0,2.0)')
+    parser.add_argument('--loss_mode', type=str, default='both', choices=['both', 'choroid_only'],
+                        help='Loss target: both classes (weighted) or choroid class only')
+    parser.add_argument('--edge_loss_weight', type=float, default=0.0,
+                        help='Optional edge-aware Dice loss weight on choroid boundaries (0 disables)')
+    parser.add_argument('--multiscale_skip_mode', type=str, default='legacy', choices=['legacy', 'token_pyramid'],
+                        help='Skip construction mode: legacy direct-token skips, or learned token pyramid skips')
+    parser.add_argument('--use_post_refine', action='store_true',
+                        help='Enable residual post-refinement head on final 224x224 decoder features')
+    parser.add_argument('--post_refine_depth', type=int, default=2,
+                        help='Number of conv-BN-ReLU blocks in post-refinement head')
+    parser.add_argument('--post_refine_channels', type=int, default=64,
+                        help='Hidden channels in post-refinement head')
+    parser.add_argument('--use_shallow_stem_fusion', action='store_true',
+                        help='Fuse shallow high-resolution CNN stem features into late decoder stages')
+    parser.add_argument('--deep_supervision', action='store_true',
+                        help='Enable auxiliary decoder heads (d2,d3) during training')
+    parser.add_argument('--aux_weight_d2', type=float, default=0.20,
+                        help='Auxiliary loss weight for d2 head when deep supervision is enabled')
+    parser.add_argument('--aux_weight_d3', type=float, default=0.10,
+                        help='Auxiliary loss weight for d3 head when deep supervision is enabled')
+    parser.add_argument('--normalize_imagenet', action='store_true',
+                        help='Apply ImageNet normalization to both train and eval transforms')
+    parser.add_argument('--augment_random_resized_crop', dest='augment_random_resized_crop', action='store_true',
+                        help='Enable random resized crop in training augmentation')
+    parser.add_argument('--no_augment_random_resized_crop', dest='augment_random_resized_crop', action='store_false',
+                        help='Disable random resized crop in training augmentation')
+    parser.set_defaults(augment_random_resized_crop=True)
+    parser.add_argument('--augment_scale_min', type=float, default=0.8,
+                        help='Minimum scale for random resized crop')
+    parser.add_argument('--augment_hflip_prob', type=float, default=0.5,
+                        help='Horizontal flip probability for training augmentation')
+    parser.add_argument('--augment_rotation_deg', type=float, default=15.0,
+                        help='Max absolute random rotation degrees for training augmentation')
+    parser.add_argument('--augment_color_jitter', dest='augment_color_jitter', action='store_true',
+                        help='Enable color jitter in training augmentation')
+    parser.add_argument('--no_augment_color_jitter', dest='augment_color_jitter', action='store_false',
+                        help='Disable color jitter in training augmentation')
+    parser.set_defaults(augment_color_jitter=True)
+    parser.add_argument('--test_split', type=float, default=0.2,
+                        help='Held-out test fraction from full dataset (e.g., 0.2)')
+    parser.add_argument('--val_split_in_trainval', type=float, default=0.2,
+                        help='Validation fraction inside the remaining (1-test_split) subset')
     return parser.parse_args()
 # Parse arguments
 args = parse_args()
+
+if not (0.0 < args.augment_scale_min <= 1.0):
+    raise ValueError(f"--augment_scale_min must be in (0, 1], got {args.augment_scale_min}")
+if not (0.0 <= args.augment_hflip_prob <= 1.0):
+    raise ValueError(f"--augment_hflip_prob must be in [0, 1], got {args.augment_hflip_prob}")
+if args.augment_rotation_deg < 0:
+    raise ValueError(f"--augment_rotation_deg must be >= 0, got {args.augment_rotation_deg}")
+if args.edge_loss_weight < 0.0:
+    raise ValueError(f"--edge_loss_weight must be >= 0, got {args.edge_loss_weight}")
+if args.post_refine_depth < 1:
+    raise ValueError(f"--post_refine_depth must be >= 1, got {args.post_refine_depth}")
+if args.post_refine_channels < 1:
+    raise ValueError(f"--post_refine_channels must be >= 1, got {args.post_refine_channels}")
+if args.enable_encoder_adapters and args.adapter_rank <= 0:
+    raise ValueError(f"--adapter_rank must be > 0, got {args.adapter_rank}")
+if not (0.0 <= args.adapter_dropout < 1.0):
+    raise ValueError(f"--adapter_dropout must be in [0, 1), got {args.adapter_dropout}")
+if args.adapter_init_scale < 0.0:
+    raise ValueError(f"--adapter_init_scale must be >= 0, got {args.adapter_init_scale}")
 
 if args.list_ablation_presets:
     print("Available ablation presets:")
@@ -117,7 +319,15 @@ if args.list_ablation_presets:
             f"fusion={preset_flags['use_fusion']}, "
             f"upconvs={preset_flags['use_upconvs']}"
         )
+    print("\nControlled A/B reference notes:")
+    for note in CONTROLLED_AB_NOTES:
+        print(f"  - {note}")
     sys.exit(0)
+
+if bool(args.val_image_dir) ^ bool(args.val_mask_dir):
+    raise ValueError("--val_image_dir and --val_mask_dir must be provided together")
+
+PROGRESSIVE_UNFREEZE_PLAN = parse_unfreeze_schedule(args.progressive_unfreeze_schedule)
 
 # Configuration based on command-line arguments
 ablation_flags = resolve_ablation_flags(args.ablation_preset)
@@ -132,6 +342,19 @@ config = {
     "use_attention": ablation_flags["use_attention"],
     "use_fusion": ablation_flags["use_fusion"],
     "use_upconvs": ablation_flags["use_upconvs"],
+    "multiscale_skip_mode": args.multiscale_skip_mode,
+    "use_shallow_stem_fusion": args.use_shallow_stem_fusion,
+    "deep_supervision": args.deep_supervision,
+    "use_post_refine": args.use_post_refine,
+    "post_refine_depth": args.post_refine_depth,
+    "post_refine_channels": args.post_refine_channels,
+    "progressive_unfreeze_schedule": args.progressive_unfreeze_schedule,
+    "edge_loss_weight": args.edge_loss_weight,
+    "enable_encoder_adapters": args.enable_encoder_adapters,
+    "adapter_rank": args.adapter_rank,
+    "adapter_blocks": args.adapter_blocks,
+    "adapter_dropout": args.adapter_dropout,
+    "adapter_init_scale": args.adapter_init_scale,
 }
 
 # Weights file paths
@@ -251,6 +474,10 @@ class DecoderBlock(nn.Module):
     def forward(self, x, s):
         x = self.up(x)
         x = self.reduce_channels_x(x)
+        # Optional no-skip path (used for final decoder stage refinement).
+        if s is None:
+            return self.c_plain(x)
+
         s = self.reduce_channels_s(s)
 
         if x.shape[-2:] != s.shape[-2:]:
@@ -267,10 +494,72 @@ class DecoderBlock(nn.Module):
             x = x + s
         return self.c_plain(x)
 
+
+class TokenBottleneckAdapter(nn.Module):
+    """
+    Lightweight residual adapter for token sequences [B, N, C].
+    """
+    def __init__(self, hidden_dim, rank=64, dropout=0.0, init_scale=1e-3):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.down = nn.Linear(hidden_dim, rank, bias=False)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(float(dropout))
+        self.up = nn.Linear(rank, hidden_dim, bias=False)
+        self.scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+        nn.init.xavier_uniform_(self.down.weight)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x):
+        z = self.norm(x)
+        z = self.down(z)
+        z = self.act(z)
+        z = self.drop(z)
+        z = self.up(z)
+        return x + self.scale * z
+
+
+class PostRefineHead(nn.Module):
+    """
+    Residual refinement head for sharper boundaries at full resolution.
+    """
+    def __init__(self, in_ch=64, hidden_ch=64, num_classes=2, depth=2):
+        super().__init__()
+        depth = max(1, int(depth))
+        blocks = []
+        c = int(in_ch)
+        h = int(hidden_ch)
+        for i in range(depth):
+            out_c = h if i < depth - 1 else c
+            blocks.extend(
+                [
+                    nn.Conv2d(c, out_c, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(out_c),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            c = out_c
+        self.refine = nn.Sequential(*blocks)
+        self.head = nn.Conv2d(int(in_ch), int(num_classes), kernel_size=1, padding=0)
+
+    def forward(self, x):
+        x = x + self.refine(x)
+        return self.head(x)
+
+
 # Main RFA-U-Net model
 class AttentionUNetViT(nn.Module):
     def __init__(self, config):
         super().__init__()
+        configured_image_size = int(config.get("image_size", 224))
+        if configured_image_size <= 0:
+            raise ValueError(f"image_size must be > 0, got {configured_image_size}")
+        if configured_image_size % 16 != 0:
+            raise ValueError(
+                f"image_size={configured_image_size} is not divisible by patch size 16; "
+                "use multiples of 16 for RETFound ViT."
+            )
         # Initialize RETFound-based ViT encoder
         self.encoder = models_vit.RETFound_mae(
             num_classes=config["num_classes"],
@@ -330,63 +619,244 @@ class AttentionUNetViT(nn.Module):
                 msg = self.load_state_dict(state_dict, strict=False)
                 print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
 
+        # Allow training/inference at a configured square resolution (e.g., 320x320) without
+        # changing checkpoint tensor shapes. Positional embeddings are resized in forward().
+        if hasattr(self.encoder, "patch_embed") and hasattr(self.encoder.patch_embed, "img_size"):
+            self.encoder.patch_embed.img_size = (configured_image_size, configured_image_size)
+            if configured_image_size != 224:
+                print(f"📐 Patch embed input size set to {configured_image_size}x{configured_image_size}")
+
 
         # Decoder blocks with ablation switches
         use_attention = config.get("use_attention", True)
         use_fusion = config.get("use_fusion", True)
         use_upconvs = config.get("use_upconvs", True)
-        self.d1 = DecoderBlock([1024, 1024], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-        self.d2 = DecoderBlock([512, 1024], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-        self.d3 = DecoderBlock([256, 1024], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-        self.d4 = DecoderBlock([128, 1024], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-        self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1, padding=0)
+        self.multiscale_skip_mode = config.get("multiscale_skip_mode", "legacy")
+        self.use_shallow_stem_fusion = bool(config.get("use_shallow_stem_fusion", False))
+        self.deep_supervision = bool(config.get("deep_supervision", False))
+        self.use_post_refine = bool(config.get("use_post_refine", False))
+        self.enable_encoder_adapters = bool(config.get("enable_encoder_adapters", False))
+        self.adapter_block_indices = []
+        self.encoder_adapters = nn.ModuleDict()
+        if self.enable_encoder_adapters:
+            hidden_dim = int(getattr(self.encoder, "embed_dim", config.get("hidden_dim", 1024)))
+            num_blocks = len(self.encoder.blocks)
+            self.adapter_block_indices = parse_block_indices(config.get("adapter_blocks", "all"), num_blocks)
+            rank = int(config.get("adapter_rank", 64))
+            dropout = float(config.get("adapter_dropout", 0.0))
+            init_scale = float(config.get("adapter_init_scale", 1e-3))
+            for i in self.adapter_block_indices:
+                self.encoder_adapters[str(i)] = TokenBottleneckAdapter(
+                    hidden_dim=hidden_dim,
+                    rank=rank,
+                    dropout=dropout,
+                    init_scale=init_scale,
+                )
+            print(
+                f"🧩 Encoder adapters enabled | rank={rank} blocks={self.adapter_block_indices} "
+                f"dropout={dropout} init_scale={init_scale}"
+            )
+        if self.multiscale_skip_mode == "token_pyramid":
+            # Learned token pyramid to inject distinct spatial scales before decoder fusion.
+            self.skip_proj_d1 = self._make_skip_pyramid(in_ch=1024, out_ch=512, up_steps=1)  # 14 -> 28
+            self.skip_proj_d2 = self._make_skip_pyramid(in_ch=1024, out_ch=256, up_steps=2)  # 14 -> 56
+            self.skip_proj_d3 = self._make_skip_pyramid(in_ch=1024, out_ch=128, up_steps=3)  # 14 -> 112
+            self.d1 = DecoderBlock([1024, 512], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d2 = DecoderBlock([512, 256], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d3 = DecoderBlock([256, 128], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d4 = DecoderBlock([128, 64], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+        else:
+            self.d1 = DecoderBlock([1024, 1024], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d2 = DecoderBlock([512, 1024], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d3 = DecoderBlock([256, 1024], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d4 = DecoderBlock([128, 1024], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+
+        if self.use_shallow_stem_fusion:
+            self.shallow_stem = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+            )
+            self.shallow_to_d3 = nn.Sequential(
+                nn.AvgPool2d(kernel_size=2, stride=2),  # 224 -> 112
+                nn.Conv2d(64, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+            )
+            self.shallow_to_d4 = nn.Sequential(
+                nn.Conv2d(64, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+            )
+
+        if self.deep_supervision:
+            self.aux_head_d2 = nn.Conv2d(256, config["num_classes"], kernel_size=1)
+            self.aux_head_d3 = nn.Conv2d(128, config["num_classes"], kernel_size=1)
+        if self.use_post_refine:
+            self.output = PostRefineHead(
+                in_ch=64,
+                hidden_ch=int(config.get("post_refine_channels", 64)),
+                num_classes=config["num_classes"],
+                depth=int(config.get("post_refine_depth", 2)),
+            )
+            print(
+                f"🔎 Post-refine head enabled | depth={int(config.get('post_refine_depth', 2))} "
+                f"hidden_ch={int(config.get('post_refine_channels', 64))}"
+            )
+        else:
+            self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1, padding=0)
+
+    @staticmethod
+    def _make_skip_pyramid(in_ch, out_ch, up_steps):
+        layers = []
+        c = in_ch
+        for step in range(up_steps):
+            is_last = (step == up_steps - 1)
+            next_c = out_ch if is_last else max(out_ch, c // 2)
+            layers.extend(
+                [
+                    nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+                    nn.Conv2d(c, next_c, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(next_c),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            c = next_c
+        return nn.Sequential(*layers)
+
+    @staticmethod
+    def _tokens_to_feature_map(tokens):
+        # tokens: [B, N, C] where N = H*W
+        b, n, c = tokens.shape
+        hw = int(n ** 0.5)
+        if hw * hw != n:
+            raise RuntimeError(f"Non-square token grid: N={n}")
+        return tokens.transpose(1, 2).reshape(b, c, hw, hw)
+
+    @staticmethod
+    def _resize_pos_embed(pos_embed, target_token_count):
+        # pos_embed: [1, 1+N, C] (includes cls token)
+        if target_token_count == pos_embed.shape[1]:
+            return pos_embed
+        cls_pos = pos_embed[:, :1, :]
+        patch_pos = pos_embed[:, 1:, :]
+        old_n = patch_pos.shape[1]
+        new_n = target_token_count - 1
+        gs_old = int(old_n ** 0.5)
+        gs_new = int(new_n ** 0.5)
+        if gs_old * gs_old != old_n or gs_new * gs_new != new_n:
+            raise RuntimeError(f"Cannot resize non-square pos_embed: old_n={old_n}, new_n={new_n}")
+        patch_pos = patch_pos.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+        patch_pos = F.interpolate(patch_pos, size=(gs_new, gs_new), mode='bicubic', align_corners=False)
+        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, gs_new * gs_new, -1)
+        return torch.cat([cls_pos, patch_pos], dim=1)
 
     def forward(self, x):
-        x = self.encoder.patch_embed(x)
-        batch_size, num_patches, embed_dim = x.shape
-        pos_embed = self.encoder.pos_embed[:, 1:, :]
-        if num_patches != pos_embed.shape[1]:
-            pos_embed = interpolate_pos_embed(self.encoder, {'pos_embed': pos_embed})
+        x_in = x
+        batch_size = x.shape[0]
+        x = self.encoder.patch_embed(x)  # [B, N, C]
+        cls_token = self.encoder.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_token, x), dim=1)  # [B, 1+N, C]
+        pos_embed = self._resize_pos_embed(self.encoder.pos_embed, x.shape[1]).to(x.device)
         x = x + pos_embed
         x = self.encoder.pos_drop(x)
         skip_connections = []
         for i, blk in enumerate(self.encoder.blocks):
             x = blk(x)
+            if self.enable_encoder_adapters:
+                key = str(i)
+                if key in self.encoder_adapters:
+                    x = self.encoder_adapters[key](x)
             if i in [5, 11, 17, 23]:
-                skip_connections.append(x)
+                skip_connections.append(x[:, 1:, :])  # drop cls token
         z6, z12, z18, z24 = skip_connections
-        z6 = z6.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
-        z12 = z12.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
-        z18 = z18.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
-        z24 = z24.transpose(1, 2).reshape(batch_size, 1024, 14, 14)
-        x = self.d1(z24, z18)
-        x = self.d2(x, z12)
-        x = self.d3(x, z6)
-        x = self.d4(x, z6)
-        output = self.output(x)
+        z6 = self._tokens_to_feature_map(z6)
+        z12 = self._tokens_to_feature_map(z12)
+        z18 = self._tokens_to_feature_map(z18)
+        z24 = self._tokens_to_feature_map(z24)
+        if self.multiscale_skip_mode == "token_pyramid":
+            s1 = self.skip_proj_d1(z18)
+            s2 = self.skip_proj_d2(z12)
+            s3 = self.skip_proj_d3(z6)
+            x = self.d1(z24, s1)
+            d2 = self.d2(x, s2)
+            d3 = self.d3(d2, s3)
+        else:
+            x = self.d1(z24, z18)
+            d2 = self.d2(x, z12)
+            d3 = self.d3(d2, z6)
+
+        if self.use_shallow_stem_fusion:
+            stem = self.shallow_stem(x_in)  # [B,64,224,224]
+            s_d3 = self.shallow_to_d3(stem)  # [B,128,112,112]
+            if s_d3.shape[-2:] != d3.shape[-2:]:
+                s_d3 = F.interpolate(s_d3, size=d3.shape[-2:], mode='bilinear', align_corners=True)
+            d3 = d3 + s_d3
+        # Final upsampling stage as pure refinement (avoid reusing z6 twice).
+        d4 = self.d4(d3, None)
+        if self.use_shallow_stem_fusion:
+            s_d4 = self.shallow_to_d4(stem)  # [B,64,224,224]
+            if s_d4.shape[-2:] != d4.shape[-2:]:
+                s_d4 = F.interpolate(s_d4, size=d4.shape[-2:], mode='bilinear', align_corners=True)
+            d4 = d4 + s_d4
+
+        output = self.output(d4)
+        if self.deep_supervision:
+            aux_d2 = self.aux_head_d2(d2)
+            aux_d3 = self.aux_head_d3(d3)
+            if aux_d2.shape[-2:] != output.shape[-2:]:
+                aux_d2 = F.interpolate(aux_d2, size=output.shape[-2:], mode='bilinear', align_corners=False)
+            if aux_d3.shape[-2:] != output.shape[-2:]:
+                aux_d3 = F.interpolate(aux_d3, size=output.shape[-2:], mode='bilinear', align_corners=False)
+            return {
+                "main": output,
+                "aux_d2": aux_d2,
+                "aux_d3": aux_d3,
+            }
         return output
 
 # Tversky Loss (Aligned with root code)
 class TverskyLoss(nn.Module):
-    def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6):
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6, class_weights=(1.0, 2.0), mode='both', choroid_class_idx=1):
         super().__init__()
         self.alpha = alpha
         self.beta  = beta
         self.smooth = smooth
+        self.class_weights = class_weights
+        self.mode = mode
+        self.choroid_class_idx = int(choroid_class_idx)
 
     def forward(self, outputs, targets):
-        # outputs: (B,2,H,W), targets: one‐hot (B,2,H,W)
-        probs = torch.sigmoid(outputs[:,1,:,:])         # only choroid channel
-        t      = targets[:,1,:,:]                       # only choroid channel
-        p_flat = probs.contiguous().view(-1)
-        t_flat = t.contiguous().view(-1)
+        # outputs: (B,2,H,W), targets: one-hot (B,2,H,W)
+        probs = torch.softmax(outputs, dim=1)
 
-        tp = (p_flat * t_flat).sum()
-        fn = ((1 - p_flat) * t_flat).sum()
-        fp = (p_flat * (1 - t_flat)).sum()
+        if self.mode == 'choroid_only':
+            c = self.choroid_class_idx
+            p = probs[:, c, :, :].contiguous().view(-1)
+            t = targets[:, c, :, :].contiguous().view(-1)
+            tp = (p * t).sum()
+            fn = ((1 - p) * t).sum()
+            fp = (p * (1 - t)).sum()
+            tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+            return 1 - tversky
 
-        tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
-        return 1 - tversky
+        per_class_losses = []
+        weight_sum = 0.0
+        for c, w in enumerate(self.class_weights):
+            p = probs[:, c, :, :].contiguous().view(-1)
+            t = targets[:, c, :, :].contiguous().view(-1)
+
+            tp = (p * t).sum()
+            fn = ((1 - p) * t).sum()
+            fp = (p * (1 - t)).sum()
+            tversky = (tp + self.smooth) / (tp + self.alpha * fn + self.beta * fp + self.smooth)
+            per_class_losses.append(float(w) * (1 - tversky))
+            weight_sum += float(w)
+
+        return sum(per_class_losses) / max(weight_sum, 1e-8)
 
 
 # Dice Loss (Defined but not used, for compatibility with root code)
@@ -396,7 +866,7 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, outputs, targets):
-        outputs = torch.sigmoid(outputs).contiguous().view(-1)
+        outputs = torch.softmax(outputs, dim=1).contiguous().view(-1)
         targets = targets.contiguous().view(-1)
         intersection = (outputs * targets).sum()
         dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
@@ -404,19 +874,84 @@ class DiceLoss(nn.Module):
 
 # Dice Score (Updated to compute both combined and choroid-specific Dice scores)
 def dice_score(outputs, targets, smooth=1e-6):
+    probs = torch.softmax(outputs, dim=1)
     # Compute combined Dice score (across both classes, matching root code)
-    outputs_combined = torch.sigmoid(outputs).contiguous().view(-1)
+    outputs_combined = probs.contiguous().view(-1)
     targets_combined = targets.contiguous().view(-1)
     intersection_combined = (outputs_combined * targets_combined).sum()
-    dice_combined = (2. * intersection_combined) / (outputs_combined.sum() + targets_combined.sum())
+    dice_combined = (2. * intersection_combined + smooth) / (outputs_combined.sum() + targets_combined.sum() + smooth)
 
     # Compute choroid-specific Dice score (channel 1)
-    outputs_choroid = torch.sigmoid(outputs[:, 1, :, :]).contiguous().view(-1)
+    outputs_choroid = probs[:, 1, :, :].contiguous().view(-1)
     targets_choroid = targets[:, 1, :, :].contiguous().view(-1)
     intersection_choroid = (outputs_choroid * targets_choroid).sum()
     dice_choroid = (2. * intersection_choroid + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
 
     return dice_combined.item(), dice_choroid.item()
+
+
+def get_main_logits(model_outputs):
+    if isinstance(model_outputs, dict):
+        if "main" not in model_outputs:
+            raise KeyError("Model output dict does not contain 'main'")
+        return model_outputs["main"]
+    return model_outputs
+
+
+def edge_dice_loss_choroid(logits, targets, choroid_idx=1, eps=1e-6):
+    """
+    Edge-aware Dice loss on choroid boundaries using Sobel magnitude maps.
+    """
+    probs = torch.softmax(logits, dim=1)[:, choroid_idx:choroid_idx + 1, :, :]
+    tgt = targets[:, choroid_idx:choroid_idx + 1, :, :].float()
+    if probs.shape[-2:] != tgt.shape[-2:]:
+        tgt = F.interpolate(tgt, size=probs.shape[-2:], mode='nearest')
+
+    kx = torch.tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+        device=probs.device,
+        dtype=probs.dtype,
+    ).unsqueeze(0)
+    ky = torch.tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+        device=probs.device,
+        dtype=probs.dtype,
+    ).unsqueeze(0)
+
+    pgx = F.conv2d(probs, kx, padding=1)
+    pgy = F.conv2d(probs, ky, padding=1)
+    tgx = F.conv2d(tgt, kx, padding=1)
+    tgy = F.conv2d(tgt, ky, padding=1)
+    p_edge = torch.sqrt(pgx * pgx + pgy * pgy + eps)
+    t_edge = torch.sqrt(tgx * tgx + tgy * tgy + eps)
+
+    p_edge = p_edge.reshape(p_edge.shape[0], -1)
+    t_edge = t_edge.reshape(t_edge.shape[0], -1)
+    inter = (p_edge * t_edge).sum(dim=1)
+    den = p_edge.sum(dim=1) + t_edge.sum(dim=1)
+    dice = (2.0 * inter + eps) / (den + eps)
+    return 1.0 - dice.mean()
+
+
+def compute_total_loss(
+    model_outputs,
+    targets,
+    criterion,
+    aux_weight_d2=0.2,
+    aux_weight_d3=0.1,
+    edge_loss_weight=0.0,
+):
+    logits = get_main_logits(model_outputs)
+    loss = criterion(logits, targets)
+    edge_w = float(edge_loss_weight)
+    if edge_w > 0.0:
+        loss = loss + edge_w * edge_dice_loss_choroid(logits, targets, choroid_idx=1)
+    if isinstance(model_outputs, dict):
+        if "aux_d2" in model_outputs:
+            loss = loss + float(aux_weight_d2) * criterion(model_outputs["aux_d2"], targets)
+        if "aux_d3" in model_outputs:
+            loss = loss + float(aux_weight_d3) * criterion(model_outputs["aux_d3"], targets)
+    return loss
 
 # Boundary Detection and Error Computation
 def find_boundaries(mask):
@@ -517,24 +1052,99 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
         plt.axis('off')
         plt.show()
 # Data Transforms
-train_transform = transforms.Compose([
-    transforms.Resize((args.image_size, args.image_size)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(degrees=15),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.RandomResizedCrop(
-        size=(args.image_size, args.image_size),
-        scale=(0.8, 1.0)
-    ),
-    transforms.ToTensor(),
-])
+class JointSegmentationTransform:
+    """Synchronized image/mask transform for segmentation."""
+    def __init__(
+        self,
+        image_size=224,
+        augment=False,
+        normalize=False,
+        num_classes=2,
+        random_resized_crop=True,
+        crop_scale_min=0.8,
+        hflip_prob=0.5,
+        rotation_deg=15.0,
+        color_jitter=True,
+    ):
+        self.image_size = int(image_size)
+        self.augment = bool(augment)
+        self.normalize = bool(normalize)
+        self.num_classes = int(num_classes)
+        self.random_resized_crop = bool(random_resized_crop)
+        self.crop_scale_min = float(crop_scale_min)
+        self.hflip_prob = float(hflip_prob)
+        self.rotation_deg = float(rotation_deg)
+        self.color_jitter_enabled = bool(color_jitter)
+        self.color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2)
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
 
-val_test_transform = transforms.Compose([
-    transforms.Resize((args.image_size, args.image_size)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  
+    def __call__(self, image, mask=None):
+        image = TF.resize(image, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
+        if mask is not None:
+            mask = TF.resize(mask, [self.image_size, self.image_size], interpolation=InterpolationMode.NEAREST)
 
-])
+        if self.augment and mask is not None:
+            if self.random_resized_crop:
+                i, j, h, w = transforms.RandomResizedCrop.get_params(
+                    image,
+                    scale=(self.crop_scale_min, 1.0),
+                    ratio=(1.0, 1.0),
+                )
+                image = TF.resized_crop(
+                    image, i, j, h, w, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR
+                )
+                mask = TF.resized_crop(
+                    mask, i, j, h, w, [self.image_size, self.image_size], interpolation=InterpolationMode.NEAREST
+                )
+
+            if self.hflip_prob > 0.0 and random.random() < self.hflip_prob:
+                image = TF.hflip(image)
+                mask = TF.hflip(mask)
+
+            if self.rotation_deg > 0.0:
+                angle = random.uniform(-self.rotation_deg, self.rotation_deg)
+                image = TF.rotate(image, angle, interpolation=InterpolationMode.BILINEAR)
+                mask = TF.rotate(mask, angle, interpolation=InterpolationMode.NEAREST)
+            if self.color_jitter_enabled:
+                image = self.color_jitter(image)
+
+        image_t = TF.to_tensor(image)
+        if self.normalize:
+            image_t = TF.normalize(image_t, mean=self.mean, std=self.std)
+
+        if mask is None:
+            return image_t
+
+        mask_np = (np.array(mask) > 0).astype(np.int64)
+        mask_t = torch.from_numpy(mask_np).long()
+        mask_onehot = F.one_hot(mask_t, num_classes=self.num_classes).permute(2, 0, 1).float()
+        return image_t, mask_onehot
+
+
+_imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+_img_eval_ops = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor()]
+if args.normalize_imagenet:
+    _img_eval_ops.append(_imagenet_norm)
+image_only_transform = transforms.Compose(_img_eval_ops)
+
+train_transform = JointSegmentationTransform(
+    image_size=args.image_size,
+    augment=True,
+    normalize=args.normalize_imagenet,
+    num_classes=2,
+    random_resized_crop=args.augment_random_resized_crop,
+    crop_scale_min=args.augment_scale_min,
+    hflip_prob=args.augment_hflip_prob,
+    rotation_deg=args.augment_rotation_deg,
+    color_jitter=args.augment_color_jitter,
+)
+val_test_transform = JointSegmentationTransform(
+    image_size=args.image_size,
+    augment=False,
+    normalize=args.normalize_imagenet,
+    num_classes=2,
+)
 def save_segmentation_results(filenames, original_sizes, predicted_masks, output_dir, segment_dir, save_overlay=False, threshold=0.5):
     """
     Save segmentation results as masks and optionally as overlay images.
@@ -661,11 +1271,34 @@ def train_fold(
     scaler,
     threshold,
     save_best_path,
+    scheduler=None,
+    early_stopping_patience=0,
+    early_stopping_min_delta=0.0,
+    aux_weight_d2=0.2,
+    aux_weight_d3=0.1,
+    edge_loss_weight=0.0,
+    progressive_unfreeze_schedule=None,
+    initial_freeze_blocks=0,
 ):
     # track best validation choroid-dice
     best_choroid = -1.0
+    patience_counter = 0
+    progressive_unfreeze_schedule = progressive_unfreeze_schedule or []
+    current_freeze = int(initial_freeze_blocks)
 
     for epoch in range(num_epochs):
+        # Optional progressive unfreezing (applies at epoch start, 1-based epochs).
+        if progressive_unfreeze_schedule and hasattr(model, "encoder"):
+            epoch_idx = epoch + 1
+            target_freeze = current_freeze
+            for start_ep, freeze_blocks in progressive_unfreeze_schedule:
+                if epoch_idx >= start_ep:
+                    target_freeze = int(freeze_blocks)
+            if target_freeze != current_freeze:
+                apply_encoder_freeze(model, target_freeze)
+                current_freeze = target_freeze
+                print(f"🔓 Progressive unfreeze update at epoch {epoch_idx}: freeze_encoder_blocks={current_freeze}")
+
         # — training pass —
         model.train()
         running_loss = 0.0
@@ -674,21 +1307,31 @@ def train_fold(
             optimizer.zero_grad()
             with autocast('cuda'):
                 outputs = model(images)
-                if torch.isnan(outputs).any():
+                logits = get_main_logits(outputs)
+                if torch.isnan(logits).any():
                     print("Warning: Model outputs contain nan values, skipping batch")
                     continue
-                loss = criterion(outputs, masks)
+                loss = compute_total_loss(
+                    outputs,
+                    masks,
+                    criterion,
+                    aux_weight_d2=aux_weight_d2,
+                    aux_weight_d3=aux_weight_d3,
+                    edge_loss_weight=edge_loss_weight,
+                )
                 if torch.isnan(loss):
                     print("Warning: Loss is nan, skipping batch")
                     continue
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}, LR: {current_lr:.2e}")
 
         # — validation pass —
         model.eval()
@@ -697,15 +1340,20 @@ def train_fold(
             for images, masks in valid_loader:
                 images, masks = images.to(device), masks.to(device)
                 outputs = model(images)
-                _, dch = dice_score(outputs, masks)
+                logits = get_main_logits(outputs)
+                _, dch = dice_score(logits, masks)
                 dice_choroid_scores.append(dch)
 
         avg_choroid = np.mean(dice_choroid_scores)
         print(f"  → Validation Choroid Dice: {avg_choroid:.4f}")
+        if scheduler is not None:
+            scheduler.step(avg_choroid)
 
         # — save best checkpoint —
-        if avg_choroid > best_choroid:
+        improved = avg_choroid > (best_choroid + early_stopping_min_delta)
+        if improved:
             best_choroid = avg_choroid
+            patience_counter = 0
             ckpt = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -716,6 +1364,18 @@ def train_fold(
             os.makedirs(os.path.dirname(save_best_path) or ".", exist_ok=True)
             torch.save(ckpt, save_best_path)
             print(f"💾 New best checkpoint saved: {save_best_path}")
+        else:
+            patience_counter += 1
+            if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+                print(f"⏹ Early stopping at epoch {epoch + 1} (patience={early_stopping_patience})")
+                break
+
+    # Load the best checkpoint before final metrics so reported results match saved model.
+    if os.path.exists(save_best_path):
+        ckpt = torch.load(save_best_path, map_location=device, weights_only=False)
+        state_dict = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
+        model.load_state_dict(state_dict, strict=False)
+        print(f"🔁 Loaded best checkpoint for final evaluation: {save_best_path}")
 
     # — after all epochs, run full evaluation on validation & test sets as before —
 
@@ -726,10 +1386,11 @@ def train_fold(
         for images, masks in valid_loader:
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
-            dice_combined, dice_choroid = dice_score(outputs, masks)
+            logits = get_main_logits(outputs)
+            dice_combined, dice_choroid = dice_score(logits, masks)
             dice_combined_scores.append(dice_combined)
             dice_choroid_scores.append(dice_choroid)
-            predicted_masks = torch.sigmoid(outputs).cpu().numpy()
+            predicted_masks = torch.softmax(logits, dim=1).cpu().numpy()
             true_masks = masks.cpu().numpy()
             for i in range(images.size(0)):
                 pm = (predicted_masks[i,1] > threshold).astype(np.uint8)
@@ -754,7 +1415,8 @@ def train_fold(
     with torch.no_grad():
         for images, masks in test_loader:
             images, masks = images.to(device), masks.to(device)
-            outputs = torch.sigmoid(model(images))
+            logits = get_main_logits(model(images))
+            outputs = torch.softmax(logits, dim=1)
             masks = F.interpolate(masks, size=outputs.shape[2:], mode='nearest')
             plot_boundaries(images, masks, outputs, threshold)
             break
@@ -824,12 +1486,15 @@ if __name__ == '__main__':
     
     model = AttentionUNetViT(config).to(device)
     
-    # Freeze early layers if using pre-trained weights
-    if args.weights_type in ['retfound', 'rfa-unet']:
-        for i, blk in enumerate(model.encoder.blocks):
-            if i < 23:
-                for p in blk.parameters():
-                    p.requires_grad = False
+    # Initial freeze policy for ViT blocks (supports progressive unfreezing later).
+    apply_encoder_freeze(model, args.freeze_encoder_blocks)
+    print(f"🔒 Frozen encoder blocks: first {args.freeze_encoder_blocks}")
+    if args.enable_encoder_adapters:
+        trainable_adapter_params = sum(p.numel() for p in model.encoder_adapters.parameters() if p.requires_grad)
+        print(
+            f"🧩 Adapter training enabled | rank={args.adapter_rank} "
+            f"blocks={model.adapter_block_indices} trainable_params={trainable_adapter_params}"
+        )
 
     # ===== SEGMENTATION MODE (No masks needed) =====
     if args.segment_dir:
@@ -839,7 +1504,7 @@ if __name__ == '__main__':
         segment_dataset = OCTSegmentationDataset(
             args.segment_dir,
             args.image_size,
-            transform=val_test_transform
+            transform=image_only_transform
         )
         
         # Custom collate function to handle original sizes as tuples
@@ -854,7 +1519,7 @@ if __name__ == '__main__':
             segment_dataset, 
             batch_size=args.batch_size,
             shuffle=False, 
-            num_workers=2, 
+            num_workers=args.num_workers, 
             pin_memory=True,
             collate_fn=custom_collate
         )
@@ -889,7 +1554,8 @@ if __name__ == '__main__':
             for batch_idx, (images, filenames, original_sizes) in enumerate(segment_loader):
                 images = images.to(device)
                 outputs = model(images)
-                predicted_masks = torch.sigmoid(outputs)
+                logits = get_main_logits(outputs)
+                predicted_masks = torch.softmax(logits, dim=1)
                 
                 # Collect only what we need for saving
                 all_filenames.extend(filenames)
@@ -941,43 +1607,160 @@ if __name__ == '__main__':
         print(f"✅ Loaded weights from {config['retfound_weights_path']}")
     
     # Setup training components
-    criterion = TverskyLoss(alpha=0.7, beta=0.3, smooth=1e-6).to(device)
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    scaler = GradScaler('cuda')
+    class_weights = parse_class_weights(args.class_weights, num_classes=2)
+    criterion = TverskyLoss(
+        alpha=0.7,
+        beta=0.3,
+        smooth=1e-6,
+        class_weights=class_weights,
+        mode=args.loss_mode,
+        choroid_class_idx=1,
+    ).to(device)
+    # Keep all params in optimizer so progressively-unfrozen blocks start updating immediately.
+    trainable_params = model.parameters()
+    if args.optimizer == 'adamw':
+        optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
+    scheduler = None
+    if args.scheduler == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            factor=args.scheduler_factor,
+            patience=args.scheduler_patience,
+        )
     save_best_path = args.save_best_path or os.path.join("weights", f"best_rfa_unet_{args.ablation_preset}.pth")
     
-    # Prepare datasets
-    full_dataset = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=val_test_transform, num_classes=2)
-    train_size = int(0.7 * len(full_dataset))
-    valid_size = int(0.15 * len(full_dataset))
-    test_size = len(full_dataset) - train_size - valid_size
-    split_generator = torch.Generator().manual_seed(args.seed)
-    train_dataset, valid_dataset, test_dataset = random_split(
-        full_dataset,
-        [train_size, valid_size, test_size],
-        generator=split_generator,
-    )
-    
-    # Apply transforms
-    train_dataset.dataset.transform = train_transform
-    valid_dataset.dataset.transform = val_test_transform
-    test_dataset.dataset.transform = val_test_transform
+    if args.val_image_dir and args.val_mask_dir:
+        # Explicit fold-based split: train on image_dir/mask_dir, validate on val_* dirs.
+        train_dataset = OCTDataset(
+            args.image_dir,
+            args.mask_dir,
+            args.image_size,
+            transform=train_transform,
+            num_classes=2,
+        )
+        valid_dataset = OCTDataset(
+            args.val_image_dir,
+            args.val_mask_dir,
+            args.image_size,
+            transform=val_test_transform,
+            num_classes=2,
+        )
+        # Keep a test loader object for visualization code-path compatibility.
+        test_dataset = valid_dataset
+        split_policy_msg = "explicit-fold (train dirs + val dirs)"
+    else:
+        # Prepare datasets (split by indices to keep train/eval transforms isolated).
+        full_dataset_eval = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=val_test_transform, num_classes=2)
+        if not (0.0 < args.test_split < 1.0):
+            raise ValueError(f"--test_split must be in (0,1), got {args.test_split}")
+        if not (0.0 < args.val_split_in_trainval < 1.0):
+            raise ValueError(f"--val_split_in_trainval must be in (0,1), got {args.val_split_in_trainval}")
+
+        total_size = len(full_dataset_eval)
+        test_size = int(round(total_size * args.test_split))
+        test_size = max(1, min(test_size, total_size - 2))
+        trainval_size = total_size - test_size
+        valid_size = int(round(trainval_size * args.val_split_in_trainval))
+        valid_size = max(1, min(valid_size, trainval_size - 1))
+        train_size = trainval_size - valid_size
+        split_generator = torch.Generator().manual_seed(args.seed)
+        indices = torch.randperm(total_size, generator=split_generator).tolist()
+        train_indices = indices[:train_size]
+        valid_indices = indices[train_size:train_size + valid_size]
+        test_indices = indices[train_size + valid_size:]
+
+        full_dataset_train = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=train_transform, num_classes=2)
+        train_dataset = Subset(full_dataset_train, train_indices)
+        valid_dataset = Subset(full_dataset_eval, valid_indices)
+        test_dataset = Subset(full_dataset_eval, test_indices)
+        split_policy_msg = f"random split: test_split={args.test_split}, val_split_in_trainval={args.val_split_in_trainval}"
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
     
     print(f"\n📊 Dataset Information:")
     print(f"   • Training samples: {len(train_dataset)}")
     print(f"   • Validation samples: {len(valid_dataset)}")
     print(f"   • Test samples: {len(test_dataset)}")
+    print(f"   • Split policy: {split_policy_msg}")
+    print(f"   • LR: {args.lr}")
+    print(f"   • Optimizer: {args.optimizer}")
+    print(f"   • Weight decay: {args.weight_decay}")
+    print(f"   • Grad clip: {args.grad_clip}")
+    print(f"   • Class weights: {class_weights}")
+    print(f"   • Loss mode: {args.loss_mode}")
+    print(f"   • Edge loss weight: {args.edge_loss_weight}")
+    print(f"   • Multiscale skip mode: {args.multiscale_skip_mode}")
+    print(
+        f"   • Post-refine head: {args.use_post_refine} "
+        f"(depth={args.post_refine_depth}, ch={args.post_refine_channels})"
+    )
+    print(f"   • Shallow stem fusion: {args.use_shallow_stem_fusion}")
+    print(f"   • Deep supervision: {args.deep_supervision} (w_d2={args.aux_weight_d2}, w_d3={args.aux_weight_d3})")
+    print(f"   • ImageNet normalization: {args.normalize_imagenet}")
+    print(
+        f"   • Augment: crop={args.augment_random_resized_crop}(scale_min={args.augment_scale_min}), "
+        f"hflip_p={args.augment_hflip_prob}, rot={args.augment_rotation_deg}, jitter={args.augment_color_jitter}"
+    )
+    print(f"   • Scheduler: {args.scheduler}")
+    if args.scheduler == 'plateau':
+        print(f"   • Scheduler factor/patience: {args.scheduler_factor}/{args.scheduler_patience}")
+    print(f"   • Freeze encoder blocks: {args.freeze_encoder_blocks}")
+    print(f"   • Progressive unfreeze schedule: '{args.progressive_unfreeze_schedule}'")
+    print(
+        f"   • Encoder adapters: {args.enable_encoder_adapters} "
+        f"(rank={args.adapter_rank}, blocks='{args.adapter_blocks}', "
+        f"dropout={args.adapter_dropout}, init_scale={args.adapter_init_scale})"
+    )
+    print(f"   • Early stopping patience/min_delta: {args.early_stopping_patience}/{args.early_stopping_min_delta}")
     print(f"   • Best checkpoint path: {save_best_path}")
     print(f"   • Starting training for {args.num_epochs} epochs...")
     
     # Train the model
     dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
-        train_loader, valid_loader, test_loader, model, criterion, optimizer, device, args.num_epochs, scaler, args.threshold, save_best_path
+        train_loader,
+        valid_loader,
+        test_loader,
+        model,
+        criterion,
+        optimizer,
+        device,
+        args.num_epochs,
+        scaler,
+        args.threshold,
+        save_best_path,
+        scheduler=scheduler,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        aux_weight_d2=args.aux_weight_d2,
+        aux_weight_d3=args.aux_weight_d3,
+        edge_loss_weight=args.edge_loss_weight,
+        progressive_unfreeze_schedule=PROGRESSIVE_UNFREEZE_PLAN,
+        initial_freeze_blocks=args.freeze_encoder_blocks,
     )
     
     # Print final results
