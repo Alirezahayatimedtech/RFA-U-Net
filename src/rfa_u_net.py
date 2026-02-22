@@ -15,6 +15,36 @@ weights and an Attention U-Net decoder for segmenting the choroid in OCT images.
 # # 3) TRAINING/ABLATION READINESS:
 # #    - Existing flags for progressive unfreezing, token-pyramid skips,
 # #      post-refine head, and edge-aware loss are preserved as first-class controls.
+# # 4) PRE-ADAPTER INPUT ALIGNMENT (NEW):
+# #    - Optional lightweight pre-adapter can remap inputs to a RETFound-friendly
+# #      canonical size/statistics before ViT patch embedding.
+# # 5) OCT-CHOROID SPECIALIZED PRE-ADAPTER (WHY + HOW):
+# #    - WHY: external OCT data has scanner/domain shifts (intensity, speckle, contrast),
+# #      and direct resizing can blur thin choroid boundaries.
+# #    - HOW: pre-adapter uses anti-aliased resize + optional InstanceNorm + lightweight
+# #      depthwise refinement; "gray_edge" mode emits [normalized gray, corrected gray, edge]
+# #      channels to preserve boundary cues for choroid segmentation while staying RETFound-compatible.
+# #    - EMPIRICAL NOTE: in our external-case review (A_5/B_5), pre-adapter qualitatively
+# #      corrected contrast/brightness mismatch that previously caused segmentation failure.
+# #      Failure-panel references (kept for reproducibility and future debugging):
+# #      /home/alireza/Code/RETFound_GeneLab/rfa/RFA-U-Net/runs_compare_best_worst_vgg19_rfa_20260221_085710/best_worst_visuals/rfa_best_baseline/worst10/01_dice_0.4916_B (5)__panel.png
+# #      /home/alireza/Code/RETFound_GeneLab/rfa/RFA-U-Net/runs_compare_best_worst_vgg19_rfa_20260221_085710/best_worst_visuals/rfa_best_baseline/worst10/02_dice_0.4967_A (5)__panel.png
+# #      Decision anchor: keep defaults --use_pre_adapter --pre_adapter_mode gray_edge --pre_adapter_norm in.
+# # 6) OCT-SAFE DEFAULTS (NEW):
+# #    - Conservative geometry/intensity augmentation defaults are set for boundary-sensitive
+# #      choroid masks (light jitter/noise, mild rotations/crops, lower adapter residual init).
+# # 7) TRUE GRAYSCALE PIPELINE (NEW):
+# #    - Supports 1-channel OCT end-to-end (--image_mode gray): loader convert('L'),
+# #      ViT patch_embed in_chans=1, and pre-adapter/weights adaptation for RGB<->Gray checkpoints.
+# # 8) BEST EXTERNAL REFERENCE SETUP (CURRENT):
+# #    - Run: runs_baseline_prog_unfreeze_external_20260217_150145
+# #    - External (N=439): Dice=0.8711, Jaccard=0.7781
+# #    - Key settings: RETFound pretrained, token_pyramid, progressive unfreeze,
+# #      normalize_imagenet=True, no post-refine, no shallow stem, no pre-adapter.
+# # 9) ADAPTER PLACEMENT CONTROL (NEW):
+# #    - Encoder adapter placement is configurable via --adapter_placement.
+# #    - Default is pre-block (adapter -> block), which is usually better than post-block
+# #      for domain/style shift since token correction happens before attention/MLP.
 
 import os
 import random
@@ -25,6 +55,7 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
+from torchvision import models as tv_models
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 from PIL import Image
@@ -65,7 +96,11 @@ CONTROLLED_AB_NOTES = [
     "exp02_v4_with_imagenet_norm: tied best (dice=0.859437, jaccard=0.760989).",
     "exp01_v4_baseline: reference baseline (dice=0.856934, jaccard=0.755490).",
     "exp06_no_pretrain_control: no RETFound pretrain control (dice=0.824202, jaccard=0.708974).",
+    "Best external reference: runs_baseline_prog_unfreeze_external_20260217_150145 "
+    "(dice=0.871067, jaccard=0.778074; token_pyramid + progressive unfreeze + normalize_imagenet; "
+    "no post-refine/shallow-stem/pre-adapter).",
     "Conclusion: RETFound pretraining gives a clear gain; most decoder flag swaps are small deltas.",
+    "Qualitative note: OCT pre-adapter improves robustness to brightness/contrast shift (observed in hard external cases such as A_5/B_5).",
 ]
 
 
@@ -165,6 +200,50 @@ def apply_encoder_freeze(model: nn.Module, freeze_blocks: int) -> None:
             p.requires_grad = req_grad
 
 
+def adapt_patch_embed_in_channels(state_dict, target_in_channels: int):
+    """
+    Adapt patch embedding weights when switching between RGB(3) and Gray(1) inputs.
+    """
+    key = "patch_embed.proj.weight"
+    if key not in state_dict:
+        return state_dict
+    w = state_dict[key]
+    if not torch.is_tensor(w) or w.ndim != 4:
+        return state_dict
+    src_in = int(w.shape[1])
+    tgt_in = int(target_in_channels)
+    if src_in == tgt_in:
+        return state_dict
+    if src_in == 3 and tgt_in == 1:
+        state_dict[key] = w.mean(dim=1, keepdim=True)
+        print("🔁 Adapted patch_embed weights from 3-channel to 1-channel (mean over RGB).")
+        return state_dict
+    if src_in == 1 and tgt_in == 3:
+        state_dict[key] = w.repeat(1, 3, 1, 1) / 3.0
+        print("🔁 Adapted patch_embed weights from 1-channel to 3-channel (replicated).")
+        return state_dict
+    return state_dict
+
+
+def load_state_dict_flexible(module: nn.Module, state_dict: dict):
+    """
+    Load state_dict while skipping shape-mismatched tensors.
+    """
+    own = module.state_dict()
+    filtered = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in own and torch.is_tensor(v) and torch.is_tensor(own[k]) and own[k].shape != v.shape:
+            skipped.append((k, tuple(v.shape), tuple(own[k].shape)))
+            continue
+        filtered[k] = v
+    msg = module.load_state_dict(filtered, strict=False)
+    if skipped:
+        preview = ", ".join([f"{k}: {s}->{t}" for k, s, t in skipped[:8]])
+        print(f"[WARN] skipped {len(skipped)} mismatched tensors while loading: {preview}")
+    return msg
+
+
 def download_retfound_weights_hf(repo_id: str, filename: str, cache_dir: str = "weights"):
     """
     Download `filename` from the HF repo `repo_id` into cache_dir and return local path.
@@ -192,6 +271,8 @@ def parse_args():
     parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
                         help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224, help='Input image size')
+    parser.add_argument('--image_mode', type=str, default='gray', choices=['rgb', 'gray'],
+                        help='Input image channel mode: gray uses true 1-channel pipeline; rgb keeps legacy 3-channel')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--num_workers', type=int, default=2, help='DataLoader worker count')
@@ -233,6 +314,8 @@ def parse_args():
                         help='Dropout in encoder adapters')
     parser.add_argument('--adapter_init_scale', type=float, default=1e-3,
                         help='Initial residual scale for adapter output')
+    parser.add_argument('--adapter_placement', type=str, default='pre', choices=['pre', 'post'],
+                        help='Adapter placement relative to each encoder block: pre (adapter->block) or post (block->adapter)')
     parser.add_argument('--early_stopping_patience', type=int, default=8,
                         help='Early stopping patience on validation choroid Dice (<=0 disables)')
     parser.add_argument('--early_stopping_min_delta', type=float, default=1e-4,
@@ -251,14 +334,46 @@ def parse_args():
                         help='Optional edge-aware Dice loss weight on choroid boundaries (0 disables)')
     parser.add_argument('--multiscale_skip_mode', type=str, default='legacy', choices=['legacy', 'token_pyramid'],
                         help='Skip construction mode: legacy direct-token skips, or learned token pyramid skips')
+    parser.add_argument('--decoder_arch', type=str, default='rfa', choices=['rfa', 'transunet', 'fundu'],
+                        help='Decoder style: rfa, transunet (RETFound ViT + TransUNet-like), or fundu (Segmenter-like mask decoder + progressive post-adapter)')
+    parser.add_argument('--transunet_hybrid_skips', dest='transunet_hybrid_skips', action='store_true',
+                        help='For decoder_arch=transunet, use ResNet50 hybrid CNN skips (28/56/112) like original TransUNet')
+    parser.add_argument('--no_transunet_hybrid_skips', dest='transunet_hybrid_skips', action='store_false',
+                        help='For decoder_arch=transunet, use token-derived skips instead of ResNet50 hybrid skips')
+    parser.set_defaults(transunet_hybrid_skips=True)
+    parser.add_argument('--transunet_r50_pretrained', dest='transunet_r50_pretrained', action='store_true',
+                        help='Initialize TransUNet hybrid ResNet50 skip backbone with ImageNet weights')
+    parser.add_argument('--no_transunet_r50_pretrained', dest='transunet_r50_pretrained', action='store_false',
+                        help='Initialize TransUNet hybrid ResNet50 skip backbone randomly')
+    parser.set_defaults(transunet_r50_pretrained=True)
+    parser.add_argument('--transunet_freeze_r50', action='store_true',
+                        help='Freeze ResNet50 hybrid skip backbone when decoder_arch=transunet')
+    parser.add_argument('--transunet_strict', dest='transunet_strict', action='store_true',
+                        help='Enforce strict TransUNet behavior (disable skip attention, shallow stem fusion, post-refine, deep supervision)')
+    parser.add_argument('--no_transunet_strict', dest='transunet_strict', action='store_false',
+                        help='Allow skip attention / shallow stem fusion / post-refine / deep supervision with decoder_arch=transunet')
+    parser.set_defaults(transunet_strict=True)
+    parser.add_argument('--fundu_decoder_layers', type=int, default=2,
+                        help='Number of transformer blocks in Fundu-style mask decoder (paper default: 2)')
+    parser.add_argument('--skip_standardize_channels', type=int, default=0,
+                        help='If >0 and token_pyramid is used, project all token skips to this common channel count (e.g., 64)')
+    parser.add_argument('--skip_attention', type=str, default='none', choices=['none', 'se', 'cbam'],
+                        help='Optional attention on projected skip features (none|se|cbam)')
+    parser.add_argument('--skip_attention_reduction', type=int, default=16,
+                        help='Channel reduction ratio for skip attention modules (SE/CBAM)')
+    parser.add_argument('--force_bilinear_decoder', action='store_true',
+                        help='Force bilinear+1x1 upsampling decoder path (disable transpose-conv upconvs)')
     parser.add_argument('--use_post_refine', action='store_true',
                         help='Enable residual post-refinement head on final 224x224 decoder features')
     parser.add_argument('--post_refine_depth', type=int, default=2,
                         help='Number of conv-BN-ReLU blocks in post-refinement head')
     parser.add_argument('--post_refine_channels', type=int, default=64,
                         help='Hidden channels in post-refinement head')
-    parser.add_argument('--use_shallow_stem_fusion', action='store_true',
+    parser.add_argument('--use_shallow_stem_fusion', dest='use_shallow_stem_fusion', action='store_true',
                         help='Fuse shallow high-resolution CNN stem features into late decoder stages')
+    parser.add_argument('--no_shallow_stem_fusion', dest='use_shallow_stem_fusion', action='store_false',
+                        help='Disable shallow high-resolution CNN stem fusion')
+    parser.set_defaults(use_shallow_stem_fusion=True)
     parser.add_argument('--deep_supervision', action='store_true',
                         help='Enable auxiliary decoder heads (d2,d3) during training')
     parser.add_argument('--aux_weight_d2', type=float, default=0.20,
@@ -267,22 +382,70 @@ def parse_args():
                         help='Auxiliary loss weight for d3 head when deep supervision is enabled')
     parser.add_argument('--normalize_imagenet', action='store_true',
                         help='Apply ImageNet normalization to both train and eval transforms')
+    parser.add_argument('--use_pre_adapter', dest='use_pre_adapter', action='store_true',
+                        help='Enable lightweight pre-adapter before ViT patch embedding')
+    parser.add_argument('--no_pre_adapter', dest='use_pre_adapter', action='store_false',
+                        help='Disable lightweight pre-adapter before ViT patch embedding')
+    parser.set_defaults(use_pre_adapter=True)
+    parser.add_argument('--pre_adapter_target_size', type=int, default=224,
+                        help='Canonical square size used by pre-adapter before patch embedding')
+    parser.add_argument('--pre_adapter_hidden_channels', type=int, default=8,
+                        help='Hidden channels in pre-adapter conv trunk')
+    parser.add_argument('--pre_adapter_depth', type=int, default=1,
+                        help='Number of depthwise-separable refinement blocks in pre-adapter trunk')
+    parser.add_argument('--pre_adapter_norm', type=str, default='in', choices=['in', 'bn'],
+                        help='Normalization inside pre-adapter: in=InstanceNorm2d, bn=BatchNorm2d')
+    parser.add_argument('--pre_adapter_mode', type=str, default='gray_edge', choices=['rgb_residual', 'gray_edge'],
+                        help='Pre-adapter style: rgb_residual (generic) or gray_edge (OCT-specialized)')
+    parser.add_argument('--pre_adapter_residual_scale_init', type=float, default=0.1,
+                        help='Initial residual scale for pre-adapter output blending (OCT-safe range ~0.05-0.15)')
+    parser.add_argument('--pre_adapter_rgb_scalars', dest='pre_adapter_rgb_scalars', action='store_true',
+                        help='Enable learnable per-channel RGB scalars in pre-adapter')
+    parser.add_argument('--no_pre_adapter_rgb_scalars', dest='pre_adapter_rgb_scalars', action='store_false',
+                        help='Disable learnable per-channel RGB scalars in pre-adapter')
+    parser.set_defaults(pre_adapter_rgb_scalars=True)
     parser.add_argument('--augment_random_resized_crop', dest='augment_random_resized_crop', action='store_true',
                         help='Enable random resized crop in training augmentation')
     parser.add_argument('--no_augment_random_resized_crop', dest='augment_random_resized_crop', action='store_false',
                         help='Disable random resized crop in training augmentation')
     parser.set_defaults(augment_random_resized_crop=True)
-    parser.add_argument('--augment_scale_min', type=float, default=0.8,
+    parser.add_argument('--augment_scale_min', type=float, default=0.9,
                         help='Minimum scale for random resized crop')
-    parser.add_argument('--augment_hflip_prob', type=float, default=0.5,
+    parser.add_argument('--augment_hflip_prob', type=float, default=0.2,
                         help='Horizontal flip probability for training augmentation')
-    parser.add_argument('--augment_rotation_deg', type=float, default=15.0,
+    parser.add_argument('--augment_rotation_deg', type=float, default=8.0,
                         help='Max absolute random rotation degrees for training augmentation')
     parser.add_argument('--augment_color_jitter', dest='augment_color_jitter', action='store_true',
                         help='Enable color jitter in training augmentation')
     parser.add_argument('--no_augment_color_jitter', dest='augment_color_jitter', action='store_false',
                         help='Disable color jitter in training augmentation')
     parser.set_defaults(augment_color_jitter=True)
+    parser.add_argument('--oct_intensity_aug', action='store_true',
+                        help='Enable OCT-style intensity augmentation (gamma + speckle + Gaussian noise + blur)')
+    parser.add_argument('--oct_brightness_jitter', type=float, default=0.1,
+                        help='Brightness jitter amplitude for OCT intensity aug')
+    parser.add_argument('--oct_contrast_jitter', type=float, default=0.1,
+                        help='Contrast jitter amplitude for OCT intensity aug')
+    parser.add_argument('--oct_gamma_min', type=float, default=0.9,
+                        help='Minimum gamma for OCT intensity aug')
+    parser.add_argument('--oct_gamma_max', type=float, default=1.1,
+                        help='Maximum gamma for OCT intensity aug')
+    parser.add_argument('--oct_speckle_prob', type=float, default=0.25,
+                        help='Probability of multiplicative speckle noise for OCT intensity aug')
+    parser.add_argument('--oct_speckle_std_min', type=float, default=0.03,
+                        help='Minimum sigma for multiplicative speckle noise')
+    parser.add_argument('--oct_speckle_std_max', type=float, default=0.07,
+                        help='Maximum sigma for multiplicative speckle noise')
+    parser.add_argument('--oct_noise_prob', type=float, default=0.2,
+                        help='Probability of additive Gaussian noise for OCT intensity aug')
+    parser.add_argument('--oct_noise_std_min', type=float, default=0.005,
+                        help='Minimum sigma for additive Gaussian noise')
+    parser.add_argument('--oct_noise_std_max', type=float, default=0.015,
+                        help='Maximum sigma for additive Gaussian noise')
+    parser.add_argument('--oct_blur_prob', type=float, default=0.1,
+                        help='Probability of Gaussian blur for OCT intensity aug')
+    parser.add_argument('--oct_blur_sigma_max', type=float, default=0.6,
+                        help='Maximum sigma for Gaussian blur in OCT intensity aug')
     parser.add_argument('--test_split', type=float, default=0.2,
                         help='Held-out test fraction from full dataset (e.g., 0.2)')
     parser.add_argument('--val_split_in_trainval', type=float, default=0.2,
@@ -299,16 +462,147 @@ if args.augment_rotation_deg < 0:
     raise ValueError(f"--augment_rotation_deg must be >= 0, got {args.augment_rotation_deg}")
 if args.edge_loss_weight < 0.0:
     raise ValueError(f"--edge_loss_weight must be >= 0, got {args.edge_loss_weight}")
+if args.skip_standardize_channels < 0:
+    raise ValueError(f"--skip_standardize_channels must be >= 0, got {args.skip_standardize_channels}")
+if args.skip_attention not in {"none", "se", "cbam"}:
+    raise ValueError(f"--skip_attention must be one of ['none','se','cbam'], got {args.skip_attention}")
+if args.skip_attention_reduction < 1:
+    raise ValueError(f"--skip_attention_reduction must be >= 1, got {args.skip_attention_reduction}")
 if args.post_refine_depth < 1:
     raise ValueError(f"--post_refine_depth must be >= 1, got {args.post_refine_depth}")
 if args.post_refine_channels < 1:
     raise ValueError(f"--post_refine_channels must be >= 1, got {args.post_refine_channels}")
+if args.pre_adapter_target_size <= 0:
+    raise ValueError(f"--pre_adapter_target_size must be > 0, got {args.pre_adapter_target_size}")
+if args.pre_adapter_target_size % 16 != 0:
+    raise ValueError(
+        f"--pre_adapter_target_size must be divisible by 16 for ViT patching, got {args.pre_adapter_target_size}"
+    )
+if args.pre_adapter_hidden_channels < 1:
+    raise ValueError(f"--pre_adapter_hidden_channels must be >= 1, got {args.pre_adapter_hidden_channels}")
+if args.pre_adapter_depth < 1:
+    raise ValueError(f"--pre_adapter_depth must be >= 1, got {args.pre_adapter_depth}")
+if args.pre_adapter_norm not in {"in", "bn"}:
+    raise ValueError(f"--pre_adapter_norm must be one of ['in','bn'], got {args.pre_adapter_norm}")
+if args.pre_adapter_mode not in {"rgb_residual", "gray_edge"}:
+    raise ValueError(
+        f"--pre_adapter_mode must be one of ['rgb_residual','gray_edge'], got {args.pre_adapter_mode}"
+    )
+if args.pre_adapter_residual_scale_init < 0.0:
+    raise ValueError(
+        f"--pre_adapter_residual_scale_init must be >= 0, got {args.pre_adapter_residual_scale_init}"
+    )
 if args.enable_encoder_adapters and args.adapter_rank <= 0:
     raise ValueError(f"--adapter_rank must be > 0, got {args.adapter_rank}")
 if not (0.0 <= args.adapter_dropout < 1.0):
     raise ValueError(f"--adapter_dropout must be in [0, 1), got {args.adapter_dropout}")
 if args.adapter_init_scale < 0.0:
     raise ValueError(f"--adapter_init_scale must be >= 0, got {args.adapter_init_scale}")
+if args.adapter_placement not in {"pre", "post"}:
+    raise ValueError(f"--adapter_placement must be one of ['pre','post'], got {args.adapter_placement}")
+if args.decoder_arch == "transunet" and args.multiscale_skip_mode != "token_pyramid":
+    print(
+        "[WARN] decoder_arch=transunet requires token_pyramid skips; overriding --multiscale_skip_mode to token_pyramid.",
+        file=sys.stderr,
+    )
+    args.multiscale_skip_mode = "token_pyramid"
+if args.decoder_arch == "transunet" and args.transunet_strict and args.skip_attention != "none":
+    print(
+        "[WARN] decoder_arch=transunet + strict mode uses plain skip fusion; overriding --skip_attention to 'none'.",
+        file=sys.stderr,
+    )
+    args.skip_attention = "none"
+if args.decoder_arch == "transunet" and args.transunet_strict and args.use_shallow_stem_fusion:
+    print(
+        "[WARN] decoder_arch=transunet + strict mode disables shallow stem fusion.",
+        file=sys.stderr,
+    )
+    args.use_shallow_stem_fusion = False
+if args.decoder_arch == "transunet" and args.transunet_strict and args.use_post_refine:
+    print(
+        "[WARN] decoder_arch=transunet + strict mode disables post-refine head.",
+        file=sys.stderr,
+    )
+    args.use_post_refine = False
+if args.decoder_arch == "transunet" and args.transunet_strict and args.deep_supervision:
+    print(
+        "[WARN] decoder_arch=transunet + strict mode disables deep supervision.",
+        file=sys.stderr,
+    )
+    args.deep_supervision = False
+if args.decoder_arch == "transunet" and not args.transunet_strict:
+    print(
+        "[INFO] decoder_arch=transunet with --no_transunet_strict: keeping user-configured skip_attention / shallow-stem / post-refine / deep-supervision.",
+        file=sys.stderr,
+    )
+if args.decoder_arch == "fundu" and args.multiscale_skip_mode != "token_pyramid":
+    print(
+        "[WARN] decoder_arch=fundu requires token_pyramid skips; overriding --multiscale_skip_mode to token_pyramid.",
+        file=sys.stderr,
+    )
+    args.multiscale_skip_mode = "token_pyramid"
+if args.decoder_arch == "fundu" and args.skip_attention != "cbam":
+    print(
+        "[WARN] decoder_arch=fundu uses CBAM skip attention by design; overriding --skip_attention to 'cbam'.",
+        file=sys.stderr,
+    )
+    args.skip_attention = "cbam"
+if args.decoder_arch == "fundu" and args.use_post_refine:
+    print(
+        "[WARN] decoder_arch=fundu already uses progressive post-adapter; disabling --use_post_refine.",
+        file=sys.stderr,
+    )
+    args.use_post_refine = False
+if args.decoder_arch == "fundu" and args.deep_supervision:
+    print(
+        "[WARN] decoder_arch=fundu disables deep supervision in current implementation.",
+        file=sys.stderr,
+    )
+    args.deep_supervision = False
+if args.decoder_arch == "fundu" and args.use_shallow_stem_fusion:
+    print(
+        "[WARN] decoder_arch=fundu disables shallow stem fusion to preserve Fundu-style decoder pathway.",
+        file=sys.stderr,
+    )
+    args.use_shallow_stem_fusion = False
+if args.decoder_arch == "fundu" and args.fundu_decoder_layers < 1:
+    raise ValueError(f"--fundu_decoder_layers must be >= 1, got {args.fundu_decoder_layers}")
+if not (0.0 <= args.oct_brightness_jitter <= 1.0):
+    raise ValueError(f"--oct_brightness_jitter must be in [0,1], got {args.oct_brightness_jitter}")
+if not (0.0 <= args.oct_contrast_jitter <= 1.0):
+    raise ValueError(f"--oct_contrast_jitter must be in [0,1], got {args.oct_contrast_jitter}")
+if not (0.0 < args.oct_gamma_min <= args.oct_gamma_max):
+    raise ValueError(
+        f"--oct_gamma_min/--oct_gamma_max invalid: min={args.oct_gamma_min}, max={args.oct_gamma_max}"
+    )
+if not (0.0 <= args.oct_speckle_prob <= 1.0):
+    raise ValueError(f"--oct_speckle_prob must be in [0,1], got {args.oct_speckle_prob}")
+if not (0.0 <= args.oct_noise_prob <= 1.0):
+    raise ValueError(f"--oct_noise_prob must be in [0,1], got {args.oct_noise_prob}")
+if not (0.0 <= args.oct_blur_prob <= 1.0):
+    raise ValueError(f"--oct_blur_prob must be in [0,1], got {args.oct_blur_prob}")
+if not (0.0 <= args.oct_speckle_std_min <= args.oct_speckle_std_max):
+    raise ValueError(
+        f"--oct_speckle_std_min/max invalid: min={args.oct_speckle_std_min}, max={args.oct_speckle_std_max}"
+    )
+if not (0.0 <= args.oct_noise_std_min <= args.oct_noise_std_max):
+    raise ValueError(
+        f"--oct_noise_std_min/max invalid: min={args.oct_noise_std_min}, max={args.oct_noise_std_max}"
+    )
+if args.oct_blur_sigma_max < 0.0:
+    raise ValueError(f"--oct_blur_sigma_max must be >= 0, got {args.oct_blur_sigma_max}")
+if args.use_pre_adapter and args.pre_adapter_residual_scale_init > 0.3:
+    print(
+        f"[WARN] pre-adapter residual init is high ({args.pre_adapter_residual_scale_init}). "
+        "For OCT boundary preservation, 0.05-0.15 is typically safer.",
+        file=sys.stderr,
+    )
+if args.use_pre_adapter and args.pre_adapter_norm == "in" and args.normalize_imagenet:
+    print(
+        "[WARN] Both input normalization and pre-adapter InstanceNorm are enabled; "
+        "this can over-normalize OCT intensity statistics.",
+        file=sys.stderr,
+    )
 
 if args.list_ablation_presets:
     print("Available ablation presets:")
@@ -335,7 +629,7 @@ config = {
     "image_size": args.image_size,
     "hidden_dim": 1024,
     "patch_size": 16,
-    "num_channels": 3,
+    "num_channels": 1 if args.image_mode == "gray" else 3,
     "num_classes": 2,
     "retfound_weights_path": args.weights_path,
     "ablation_preset": args.ablation_preset,
@@ -343,6 +637,15 @@ config = {
     "use_fusion": ablation_flags["use_fusion"],
     "use_upconvs": ablation_flags["use_upconvs"],
     "multiscale_skip_mode": args.multiscale_skip_mode,
+    "decoder_arch": args.decoder_arch,
+    "fundu_decoder_layers": args.fundu_decoder_layers,
+    "transunet_hybrid_skips": args.transunet_hybrid_skips,
+    "transunet_r50_pretrained": args.transunet_r50_pretrained,
+    "transunet_freeze_r50": args.transunet_freeze_r50,
+    "skip_standardize_channels": args.skip_standardize_channels,
+    "skip_attention": args.skip_attention,
+    "skip_attention_reduction": args.skip_attention_reduction,
+    "force_bilinear_decoder": args.force_bilinear_decoder,
     "use_shallow_stem_fusion": args.use_shallow_stem_fusion,
     "deep_supervision": args.deep_supervision,
     "use_post_refine": args.use_post_refine,
@@ -350,11 +653,20 @@ config = {
     "post_refine_channels": args.post_refine_channels,
     "progressive_unfreeze_schedule": args.progressive_unfreeze_schedule,
     "edge_loss_weight": args.edge_loss_weight,
+    "use_pre_adapter": args.use_pre_adapter,
+    "pre_adapter_target_size": args.pre_adapter_target_size,
+    "pre_adapter_hidden_channels": args.pre_adapter_hidden_channels,
+    "pre_adapter_depth": args.pre_adapter_depth,
+    "pre_adapter_norm": args.pre_adapter_norm,
+    "pre_adapter_mode": args.pre_adapter_mode,
+    "pre_adapter_residual_scale_init": args.pre_adapter_residual_scale_init,
+    "pre_adapter_rgb_scalars": args.pre_adapter_rgb_scalars,
     "enable_encoder_adapters": args.enable_encoder_adapters,
     "adapter_rank": args.adapter_rank,
     "adapter_blocks": args.adapter_blocks,
     "adapter_dropout": args.adapter_dropout,
     "adapter_init_scale": args.adapter_init_scale,
+    "adapter_placement": args.adapter_placement,
 }
 
 # Weights file paths
@@ -421,6 +733,61 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+
+class TransUNetHybridResNetSkips(nn.Module):
+    """
+    Hybrid CNN skip path used in original TransUNet (R50-ViT):
+      s1: 512 channels @ 28x28
+      s2: 256 channels @ 56x56
+      s3:  64 channels @ 112x112
+    """
+    def __init__(self, in_channels: int = 3, pretrained: bool = True):
+        super().__init__()
+        try:
+            weights = tv_models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = tv_models.resnet50(weights=weights)
+        except Exception:
+            backbone = tv_models.resnet50(pretrained=bool(pretrained))
+
+        # Adapt stem conv to grayscale (or arbitrary in_channels) if needed.
+        if int(in_channels) != 3:
+            old = backbone.conv1
+            new_conv = nn.Conv2d(
+                int(in_channels),
+                old.out_channels,
+                kernel_size=old.kernel_size,
+                stride=old.stride,
+                padding=old.padding,
+                bias=False,
+            )
+            with torch.no_grad():
+                if int(in_channels) == 1:
+                    new_conv.weight.copy_(old.weight.mean(dim=1, keepdim=True))
+                else:
+                    rep = (int(in_channels) + 2) // 3
+                    w = old.weight.repeat(1, rep, 1, 1)[:, : int(in_channels), :, :] / float(rep)
+                    new_conv.weight.copy_(w)
+            backbone.conv1 = new_conv
+
+        self.conv1 = backbone.conv1
+        self.bn1 = backbone.bn1
+        self.relu = backbone.relu
+        self.maxpool = backbone.maxpool
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        s3 = x          # 64 @ 112x112
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        s2 = x          # 256 @ 56x56
+        x = self.layer2(x)
+        s1 = x          # 512 @ 28x28
+        return s1, s2, s3
 
 # Attention gate for skip connections
 class AttentionGate(nn.Module):
@@ -495,6 +862,158 @@ class DecoderBlock(nn.Module):
         return self.c_plain(x)
 
 
+class TransUNetDecoderBlock(nn.Module):
+    """
+    TransUNet-style decoder block:
+      upsample (bilinear) -> concat skip (if provided) -> 2x(Conv3x3+BN+ReLU)
+    """
+    def __init__(self, in_channels: int, out_channels: int, skip_channels: int = 0):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv = ConvBlock(int(in_channels) + int(skip_channels), int(out_channels))
+
+    def forward(self, x, skip=None):
+        x = self.up(x)
+        if skip is not None:
+            if skip.shape[-2:] != x.shape[-2:]:
+                skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=True)
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class FunduBasicBlock(nn.Module):
+    """
+    Basic Conv-Norm-ReLU block used in Fundu-style pre/post adapters.
+    """
+    def __init__(self, in_channels: int, out_channels: int, norm: str = "bn"):
+        super().__init__()
+        c_in = int(in_channels)
+        c_out = int(out_channels)
+        self.conv = nn.Conv2d(c_in, c_out, kernel_size=3, padding=1, bias=False)
+        if str(norm).lower() == "in":
+            self.norm = nn.InstanceNorm2d(c_out, affine=True)
+        else:
+            self.norm = nn.BatchNorm2d(c_out)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+class FunduMaskTransformerDecoder(nn.Module):
+    """
+    Segmenter-style mask decoder:
+      - append class tokens
+      - run a small transformer over [class + patch tokens]
+      - obtain masks by class-token vs patch-token similarity.
+    """
+    def __init__(self, embed_dim: int = 1024, num_classes: int = 2, num_layers: int = 2, num_heads: int = 16):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.num_classes = int(num_classes)
+        layers = max(1, int(num_layers))
+        heads = max(1, int(num_heads))
+        self.class_tokens = nn.Parameter(torch.zeros(1, self.num_classes, self.embed_dim))
+        self.blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=self.embed_dim,
+                    nhead=heads,
+                    dim_feedforward=self.embed_dim * 4,
+                    dropout=0.0,
+                    activation='gelu',
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(layers)
+            ]
+        )
+        self.norm = nn.LayerNorm(self.embed_dim)
+        trunc_normal_(self.class_tokens, std=0.02)
+
+    def forward(self, patch_tokens):
+        # patch_tokens: [B, N, C]
+        b, n, c = patch_tokens.shape
+        if int(c) != self.embed_dim:
+            raise RuntimeError(f"FunduMaskTransformerDecoder expects embed_dim={self.embed_dim}, got {c}")
+        gs = int(n ** 0.5)
+        if gs * gs != n:
+            raise RuntimeError(f"FunduMaskTransformerDecoder expects square token grid, got N={n}")
+
+        cls = self.class_tokens.expand(b, -1, -1)
+        x = torch.cat([cls, patch_tokens], dim=1)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        cls = x[:, : self.num_classes, :]
+        patches = x[:, self.num_classes :, :]
+
+        cls = F.normalize(cls, dim=-1)
+        patches = F.normalize(patches, dim=-1)
+        logits = torch.einsum('bqc,bnc->bqn', cls, patches)  # [B, Q, N]
+        return logits.view(b, self.num_classes, gs, gs)
+
+
+class FunduSkipBranch(nn.Module):
+    """
+    RETFound token-map skip -> 64ch projection -> progressive bicubic upsampling -> optional attention.
+    """
+    def __init__(self, in_channels: int = 1024, out_channels: int = 64, up_steps: int = 0, norm: str = "bn", attn: nn.Module = None):
+        super().__init__()
+        self.proj = nn.Conv2d(int(in_channels), int(out_channels), kernel_size=1, padding=0, bias=False)
+        self.proj_norm = nn.BatchNorm2d(int(out_channels))
+        self.proj_act = nn.ReLU(inplace=True)
+        self.blocks = nn.ModuleList([FunduBasicBlock(out_channels, out_channels, norm=norm) for _ in range(max(0, int(up_steps)))])
+        self.attn = attn if attn is not None else nn.Identity()
+
+    def forward(self, x):
+        x = self.proj(x)
+        x = self.proj_act(self.proj_norm(x))
+        for blk in self.blocks:
+            x = F.interpolate(x, scale_factor=2.0, mode='bicubic', align_corners=False)
+            x = blk(x)
+        return self.attn(x)
+
+
+class FunduPostAdapter(nn.Module):
+    """
+    Progressive post-adapter from 14x14 mask logits to full-resolution segmentation.
+    Stages: 14->28->56->112->224, with skip fusion (concat + Conv-Norm-ReLU) at each stage.
+    """
+    def __init__(self, num_classes: int = 2, base_channels: int = 64, norm: str = "bn"):
+        super().__init__()
+        c = int(base_channels)
+        q = int(num_classes)
+        self.stem = FunduBasicBlock(q, c, norm=norm)
+        self.fuse_28 = FunduBasicBlock(c + c, c, norm=norm)
+        self.fuse_56 = FunduBasicBlock(c + c, c, norm=norm)
+        self.fuse_112 = FunduBasicBlock(c + c, c, norm=norm)
+        self.fuse_224 = FunduBasicBlock(c + c, c, norm=norm)
+        self.refine = FunduBasicBlock(c, c, norm=norm)
+        self.out = nn.Conv2d(c, q, kernel_size=1, padding=0)
+
+    @staticmethod
+    def _cat_fuse(x, s, block):
+        if s is not None:
+            if s.shape[-2:] != x.shape[-2:]:
+                s = F.interpolate(s, size=x.shape[-2:], mode='bicubic', align_corners=False)
+            x = torch.cat([x, s], dim=1)
+        return block(x)
+
+    def forward(self, mask_14, skip_28, skip_56, skip_112, skip_224):
+        x = self.stem(mask_14)
+        x = F.interpolate(x, scale_factor=2.0, mode='bicubic', align_corners=False)   # 14 -> 28
+        x = self._cat_fuse(x, skip_28, self.fuse_28)
+        x = F.interpolate(x, scale_factor=2.0, mode='bicubic', align_corners=False)   # 28 -> 56
+        x = self._cat_fuse(x, skip_56, self.fuse_56)
+        x = F.interpolate(x, scale_factor=2.0, mode='bicubic', align_corners=False)   # 56 -> 112
+        x = self._cat_fuse(x, skip_112, self.fuse_112)
+        x = F.interpolate(x, scale_factor=2.0, mode='bicubic', align_corners=False)   # 112 -> 224
+        x = self._cat_fuse(x, skip_224, self.fuse_224)
+        x = self.refine(x)
+        return self.out(x)
+
+
 class TokenBottleneckAdapter(nn.Module):
     """
     Lightweight residual adapter for token sequences [B, N, C].
@@ -518,6 +1037,63 @@ class TokenBottleneckAdapter(nn.Module):
         z = self.drop(z)
         z = self.up(z)
         return x + self.scale * z
+
+
+class SkipSE(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        c = int(channels)
+        r = max(1, int(reduction))
+        hidden = max(1, c // r)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(c, hidden, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        a = self.fc(self.pool(x))
+        return x * a
+
+
+class SkipCBAM(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        c = int(channels)
+        r = max(1, int(reduction))
+        hidden = max(1, c // r)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(c, hidden, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c, kernel_size=1, bias=False),
+        )
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        avg = torch.mean(x, dim=(2, 3), keepdim=True)
+        mx = torch.amax(x, dim=(2, 3), keepdim=True)
+        ca = torch.sigmoid(self.mlp(avg) + self.mlp(mx))
+        x = x * ca
+        avg_s = torch.mean(x, dim=1, keepdim=True)
+        max_s = torch.amax(x, dim=1, keepdim=True)
+        sa = self.spatial(torch.cat([avg_s, max_s], dim=1))
+        return x * sa
+
+
+def build_skip_attention(kind: str, channels: int, reduction: int):
+    k = str(kind).strip().lower()
+    if k == "none":
+        return nn.Identity()
+    if k == "se":
+        return SkipSE(channels=channels, reduction=reduction)
+    if k == "cbam":
+        return SkipCBAM(channels=channels, reduction=reduction)
+    raise ValueError(f"unsupported skip attention kind: {kind}")
 
 
 class PostRefineHead(nn.Module):
@@ -548,26 +1124,209 @@ class PostRefineHead(nn.Module):
         return self.head(x)
 
 
+class DWConvBlock(nn.Module):
+    """
+    Depthwise-separable block with configurable norm for OCT style adaptation.
+    """
+    def __init__(self, channels=16, norm_type="in"):
+        super().__init__()
+        c = int(channels)
+        self.dw = nn.Conv2d(c, c, kernel_size=3, padding=1, groups=c, bias=False)
+        self.pw = nn.Conv2d(c, c, kernel_size=1, bias=False)
+        if norm_type == "bn":
+            self.norm = nn.BatchNorm2d(c)
+        else:
+            self.norm = nn.InstanceNorm2d(c, affine=True)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.norm(x)
+        return self.act(x)
+
+
+class PreAdapter(nn.Module):
+    """
+    OCT-oriented pre-adapter:
+      1) anti-aliased resize to canonical RETFound size,
+      2) lightweight depthwise-separable refinement with InstanceNorm/BatchNorm,
+      3) safe residual blend + optional RGB channel scalars.
+    """
+    def __init__(
+        self,
+        in_ch=3,
+        hidden_ch=8,
+        depth=1,
+        target_size=224,
+        residual_scale_init=0.1,
+        norm_type="in",
+        mode="gray_edge",
+        use_rgb_scalars=True,
+    ):
+        super().__init__()
+        self.target_size = int(target_size)
+        depth = max(1, int(depth))
+        hidden_ch = int(hidden_ch)
+        if norm_type not in {"in", "bn"}:
+            raise ValueError(f"norm_type must be 'in' or 'bn', got {norm_type}")
+        if mode not in {"rgb_residual", "gray_edge"}:
+            raise ValueError(f"mode must be 'rgb_residual' or 'gray_edge', got {mode}")
+        self.norm_type = norm_type
+        self.mode = mode
+
+        c_in = int(in_ch)
+        if self.mode == "gray_edge":
+            if norm_type == "bn":
+                gray_norm = nn.BatchNorm2d(1)
+                stem_norm = nn.BatchNorm2d(hidden_ch)
+            else:
+                gray_norm = nn.InstanceNorm2d(1, affine=True)
+                stem_norm = nn.InstanceNorm2d(hidden_ch, affine=True)
+            self.gray_norm = gray_norm
+            self.stem = nn.Sequential(
+                nn.Conv2d(1, hidden_ch, kernel_size=3, padding=1, bias=False),
+                stem_norm,
+                nn.ReLU(inplace=True),
+            )
+            self.blocks = nn.Sequential(*[DWConvBlock(hidden_ch, norm_type=norm_type) for _ in range(depth)])
+            self.to_gray = nn.Conv2d(hidden_ch, 1, kernel_size=1, padding=0, bias=True)
+        else:
+            if norm_type == "bn":
+                stem_norm = nn.BatchNorm2d(hidden_ch)
+            else:
+                stem_norm = nn.InstanceNorm2d(hidden_ch, affine=True)
+            self.stem = nn.Sequential(
+                nn.Conv2d(c_in, hidden_ch, kernel_size=3, padding=1, bias=False),
+                stem_norm,
+                nn.ReLU(inplace=True),
+            )
+            self.blocks = nn.Sequential(*[DWConvBlock(hidden_ch, norm_type=norm_type) for _ in range(depth)])
+            self.to_rgb = nn.Conv2d(hidden_ch, c_in, kernel_size=1, padding=0, bias=True)
+        self.res_scale = nn.Parameter(torch.tensor(float(residual_scale_init), dtype=torch.float32))
+        self.use_rgb_scalars = bool(use_rgb_scalars)
+        if self.use_rgb_scalars:
+            self.rgb_scale = nn.Parameter(torch.ones(1, int(in_ch), 1, 1, dtype=torch.float32))
+        else:
+            self.register_parameter("rgb_scale", None)
+
+    @staticmethod
+    def _anti_alias_resize(x, target_size):
+        # Fixed 3x3 box blur before bicubic resize to reduce aliasing.
+        k = torch.ones((1, 1, 3, 3), device=x.device, dtype=x.dtype) / 9.0
+        x_blur = F.conv2d(x, k.repeat(x.shape[1], 1, 1, 1), padding=1, groups=x.shape[1])
+        return F.interpolate(
+            x_blur,
+            size=(int(target_size), int(target_size)),
+            mode='bicubic',
+            align_corners=False,
+        )
+
+    @staticmethod
+    def _sobel_mag(x):
+        kx = torch.tensor(
+            [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+            device=x.device,
+            dtype=x.dtype,
+        ).unsqueeze(0)
+        ky = torch.tensor(
+            [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+            device=x.device,
+            dtype=x.dtype,
+        ).unsqueeze(0)
+        gx = F.conv2d(x, kx, padding=1)
+        gy = F.conv2d(x, ky, padding=1)
+        g = torch.sqrt(gx * gx + gy * gy + 1e-6)
+        denom = g.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        return g / denom
+
+    def forward(self, x):
+        base = self._anti_alias_resize(x, self.target_size)
+        if self.mode == "gray_edge":
+            if base.shape[1] == 1:
+                gray = base
+            else:
+                gray = 0.2989 * base[:, 0:1] + 0.5870 * base[:, 1:2] + 0.1140 * base[:, 2:3]
+            gray_norm = self.gray_norm(gray)
+            z = self.stem(gray_norm)
+            z = self.blocks(z)
+            z = self.to_gray(z)
+            corrected = gray + self.res_scale * z
+            if base.shape[1] == 1:
+                out = corrected
+            else:
+                edge = self._sobel_mag(corrected)
+                out = torch.cat([gray_norm, corrected, edge], dim=1)
+        else:
+            z = self.stem(base)
+            z = self.blocks(z)
+            z = self.to_rgb(z)
+            out = base + self.res_scale * z
+        if self.rgb_scale is not None:
+            out = out * self.rgb_scale
+        return out
+
+
 # Main RFA-U-Net model
 class AttentionUNetViT(nn.Module):
     def __init__(self, config):
         super().__init__()
-        configured_image_size = int(config.get("image_size", 224))
-        if configured_image_size <= 0:
-            raise ValueError(f"image_size must be > 0, got {configured_image_size}")
-        if configured_image_size % 16 != 0:
+        self.configured_image_size = int(config.get("image_size", 224))
+        self.input_channels = int(config.get("num_channels", 3))
+        if self.configured_image_size <= 0:
+            raise ValueError(f"image_size must be > 0, got {self.configured_image_size}")
+        if self.configured_image_size % 16 != 0:
             raise ValueError(
-                f"image_size={configured_image_size} is not divisible by patch size 16; "
+                f"image_size={self.configured_image_size} is not divisible by patch size 16; "
                 "use multiples of 16 for RETFound ViT."
+            )
+        if self.input_channels not in {1, 3}:
+            raise ValueError(f"num_channels must be 1 or 3, got {self.input_channels}")
+        self.use_pre_adapter = bool(config.get("use_pre_adapter", False))
+        self.pre_adapter_target_size = int(config.get("pre_adapter_target_size", 224))
+        if self.pre_adapter_target_size <= 0:
+            raise ValueError(f"pre_adapter_target_size must be > 0, got {self.pre_adapter_target_size}")
+        if self.pre_adapter_target_size % 16 != 0:
+            raise ValueError(
+                f"pre_adapter_target_size={self.pre_adapter_target_size} is not divisible by patch size 16."
             )
         # Initialize RETFound-based ViT encoder
         self.encoder = models_vit.RETFound_mae(
             num_classes=config["num_classes"],
             drop_path_rate=0.2,
             global_pool=True,
+            in_chans=self.input_channels,
         )
-        # Modify patch embedding for 3-channel input
-        self.encoder.patch_embed.proj = nn.Conv2d(3, 1024, kernel_size=(16, 16), stride=(16, 16))
+        if self.use_pre_adapter:
+            self.pre_adapter = PreAdapter(
+                in_ch=self.input_channels,
+                hidden_ch=int(config.get("pre_adapter_hidden_channels", 8)),
+                depth=int(config.get("pre_adapter_depth", 1)),
+                target_size=self.pre_adapter_target_size,
+                residual_scale_init=float(config.get("pre_adapter_residual_scale_init", 0.1)),
+                norm_type=str(config.get("pre_adapter_norm", "in")),
+                mode=str(config.get("pre_adapter_mode", "gray_edge")),
+                use_rgb_scalars=bool(config.get("pre_adapter_rgb_scalars", True)),
+            )
+            encoder_input_size = self.pre_adapter_target_size
+            print(
+                f"🧱 Pre-adapter enabled | target={self.pre_adapter_target_size} "
+                f"hidden_ch={int(config.get('pre_adapter_hidden_channels', 8))} "
+                f"depth={int(config.get('pre_adapter_depth', 1))} "
+                f"norm={str(config.get('pre_adapter_norm', 'in'))} "
+                f"mode={str(config.get('pre_adapter_mode', 'gray_edge'))} "
+                f"rgb_scalars={bool(config.get('pre_adapter_rgb_scalars', True))}"
+            )
+            if self.pre_adapter_target_size != self.configured_image_size:
+                print(
+                    f"📐 Pre-adapter canonical size {self.pre_adapter_target_size} differs from input resize "
+                    f"{self.configured_image_size}; decoder logits will be upsampled back to input size."
+                )
+        else:
+            self.pre_adapter = None
+            encoder_input_size = self.configured_image_size
+        # Ensure patch embedding matches selected input channel count.
+        self.encoder.patch_embed.proj = nn.Conv2d(self.input_channels, 1024, kernel_size=(16, 16), stride=(16, 16))
         # Load weights if specified
         if args.weights_type in ['retfound', 'rfa-unet']:
             # ensure file exists
@@ -604,6 +1363,7 @@ class AttentionUNetViT(nn.Module):
 
 
             if args.weights_type == 'retfound':
+                state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=self.input_channels)
                 # remove incompatible keys, interpolate positional embeddings
                 own = self.encoder.state_dict()
                 for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
@@ -611,33 +1371,65 @@ class AttentionUNetViT(nn.Module):
                         print(f"Removing key {k} from pretrained checkpoint")
                         del state_dict[k]
                 interpolate_pos_embed(self.encoder, state_dict)
-                msg = self.encoder.load_state_dict(state_dict, strict=False)
+                msg = load_state_dict_flexible(self.encoder, state_dict)
                 print("Loaded RETFound weights, missing keys:", msg.missing_keys)
                 trunc_normal_(self.encoder.head.weight, std=2e-5)
             else:
                 # pure RFA-U-Net checkpoint
-                msg = self.load_state_dict(state_dict, strict=False)
+                state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=self.input_channels)
+                msg = load_state_dict_flexible(self, state_dict)
                 print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
 
-        # Allow training/inference at a configured square resolution (e.g., 320x320) without
-        # changing checkpoint tensor shapes. Positional embeddings are resized in forward().
+        # Allow training/inference at runtime sizes by resizing positional embeddings in forward().
+        # If pre-adapter is enabled, ViT itself operates at pre_adapter_target_size.
         if hasattr(self.encoder, "patch_embed") and hasattr(self.encoder.patch_embed, "img_size"):
-            self.encoder.patch_embed.img_size = (configured_image_size, configured_image_size)
-            if configured_image_size != 224:
-                print(f"📐 Patch embed input size set to {configured_image_size}x{configured_image_size}")
+            self.encoder.patch_embed.img_size = (encoder_input_size, encoder_input_size)
+            if encoder_input_size != 224:
+                print(f"📐 Patch embed input size set to {encoder_input_size}x{encoder_input_size}")
 
 
         # Decoder blocks with ablation switches
         use_attention = config.get("use_attention", True)
         use_fusion = config.get("use_fusion", True)
         use_upconvs = config.get("use_upconvs", True)
+        if bool(config.get("force_bilinear_decoder", False)):
+            use_upconvs = False
         self.multiscale_skip_mode = config.get("multiscale_skip_mode", "legacy")
-        self.use_shallow_stem_fusion = bool(config.get("use_shallow_stem_fusion", False))
+        self.decoder_arch = str(config.get("decoder_arch", "rfa")).strip().lower()
+        self.skip_standardize_channels = int(config.get("skip_standardize_channels", 0))
+        self.skip_attention = str(config.get("skip_attention", "none")).strip().lower()
+        self.skip_attention_reduction = int(config.get("skip_attention_reduction", 16))
+        self.transunet_hybrid_skips = bool(config.get("transunet_hybrid_skips", True))
+        self.transunet_r50_pretrained = bool(config.get("transunet_r50_pretrained", True))
+        self.transunet_freeze_r50 = bool(config.get("transunet_freeze_r50", False))
+        self.fundu_decoder_layers = int(config.get("fundu_decoder_layers", 2))
+        self.force_bilinear_decoder = bool(config.get("force_bilinear_decoder", False))
+        if self.decoder_arch not in {"rfa", "transunet", "fundu"}:
+            raise ValueError(f"decoder_arch must be one of ['rfa','transunet','fundu'], got {self.decoder_arch}")
+        if self.skip_attention not in {"none", "se", "cbam"}:
+            raise ValueError(f"skip_attention must be one of ['none','se','cbam'], got {self.skip_attention}")
+        if self.skip_attention_reduction < 1:
+            raise ValueError(f"skip_attention_reduction must be >=1, got {self.skip_attention_reduction}")
+        self.use_shallow_stem_fusion = bool(config.get("use_shallow_stem_fusion", True))
         self.deep_supervision = bool(config.get("deep_supervision", False))
         self.use_post_refine = bool(config.get("use_post_refine", False))
         self.enable_encoder_adapters = bool(config.get("enable_encoder_adapters", False))
         self.adapter_block_indices = []
         self.encoder_adapters = nn.ModuleDict()
+        self.transunet_conv_more = None
+        self.transunet_hybrid_skip_net = None
+        self.fundu_mask_decoder = None
+        self.fundu_skip_28 = None
+        self.fundu_skip_56 = None
+        self.fundu_skip_112 = None
+        self.fundu_skip_224 = None
+        self.fundu_post_adapter = None
+        self.d2_out_channels = 256
+        self.d3_out_channels = 128
+        self.decoder_out_channels = 64
+        self.adapter_placement = str(config.get("adapter_placement", "pre")).strip().lower()
+        if self.adapter_placement not in {"pre", "post"}:
+            raise ValueError(f"adapter_placement must be 'pre' or 'post', got {self.adapter_placement}")
         if self.enable_encoder_adapters:
             hidden_dim = int(getattr(self.encoder, "embed_dim", config.get("hidden_dim", 1024)))
             num_blocks = len(self.encoder.blocks)
@@ -654,26 +1446,124 @@ class AttentionUNetViT(nn.Module):
                 )
             print(
                 f"🧩 Encoder adapters enabled | rank={rank} blocks={self.adapter_block_indices} "
-                f"dropout={dropout} init_scale={init_scale}"
+                f"dropout={dropout} init_scale={init_scale} placement={self.adapter_placement}"
             )
         if self.multiscale_skip_mode == "token_pyramid":
             # Learned token pyramid to inject distinct spatial scales before decoder fusion.
-            self.skip_proj_d1 = self._make_skip_pyramid(in_ch=1024, out_ch=512, up_steps=1)  # 14 -> 28
-            self.skip_proj_d2 = self._make_skip_pyramid(in_ch=1024, out_ch=256, up_steps=2)  # 14 -> 56
-            self.skip_proj_d3 = self._make_skip_pyramid(in_ch=1024, out_ch=128, up_steps=3)  # 14 -> 112
-            self.d1 = DecoderBlock([1024, 512], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-            self.d2 = DecoderBlock([512, 256], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-            self.d3 = DecoderBlock([256, 128], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-            self.d4 = DecoderBlock([128, 64], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            if self.decoder_arch == "fundu":
+                c1, c2, c3 = 64, 64, 64
+            elif self.decoder_arch == "transunet" and self.transunet_hybrid_skips:
+                # Original TransUNet hybrid skip channels from CNN (R50): [512, 256, 64].
+                c1, c2, c3 = 512, 256, 64
+            elif self.skip_standardize_channels > 0:
+                c1 = c2 = c3 = int(self.skip_standardize_channels)
+            else:
+                if self.decoder_arch == "transunet":
+                    # TransUNet-like decoder expects skip channels [512, 256, 64].
+                    c1, c2, c3 = 512, 256, 64
+                else:
+                    c1, c2, c3 = 512, 256, 128
+            if self.decoder_arch == "fundu":
+                # Fundu-style fixed CBAM skip pipeline at scales 28/56/112/224.
+                cbam = lambda: build_skip_attention("cbam", channels=64, reduction=self.skip_attention_reduction)
+                self.fundu_skip_28 = FunduSkipBranch(in_channels=1024, out_channels=64, up_steps=1, norm="bn", attn=cbam())   # z24: 14->28
+                self.fundu_skip_56 = FunduSkipBranch(in_channels=1024, out_channels=64, up_steps=2, norm="bn", attn=cbam())   # z18: 14->56
+                self.fundu_skip_112 = FunduSkipBranch(in_channels=1024, out_channels=64, up_steps=3, norm="bn", attn=cbam())  # z12: 14->112
+                self.fundu_skip_224 = FunduSkipBranch(in_channels=1024, out_channels=64, up_steps=4, norm="bn", attn=cbam())  # z6: 14->224
+                self.fundu_mask_decoder = FunduMaskTransformerDecoder(
+                    embed_dim=1024,
+                    num_classes=config["num_classes"],
+                    num_layers=self.fundu_decoder_layers,
+                    num_heads=16,
+                )
+                self.fundu_post_adapter = FunduPostAdapter(
+                    num_classes=config["num_classes"],
+                    base_channels=64,
+                    norm="bn",
+                )
+                self.d2_out_channels = 64
+                self.d3_out_channels = 64
+                self.decoder_out_channels = 64
+                print(
+                    f"🧱 Decoder arch=fundu | mask_decoder_layers={self.fundu_decoder_layers} "
+                    f"with progressive post-adapter + CBAM skips (28/56/112/224)"
+                )
+            elif self.decoder_arch == "transunet" and self.transunet_hybrid_skips:
+                self.skip_proj_d1 = None
+                self.skip_proj_d2 = None
+                self.skip_proj_d3 = None
+                self.skip_attn_d1 = nn.Identity()
+                self.skip_attn_d2 = nn.Identity()
+                self.skip_attn_d3 = nn.Identity()
+                self.transunet_hybrid_skip_net = TransUNetHybridResNetSkips(
+                    in_channels=self.input_channels,
+                    pretrained=self.transunet_r50_pretrained,
+                )
+                if self.transunet_freeze_r50:
+                    for p in self.transunet_hybrid_skip_net.parameters():
+                        p.requires_grad = False
+            else:
+                self.skip_proj_d1 = self._make_skip_pyramid(in_ch=1024, out_ch=c1, up_steps=1)  # 14 -> 28
+                self.skip_proj_d2 = self._make_skip_pyramid(in_ch=1024, out_ch=c2, up_steps=2)  # 14 -> 56
+                self.skip_proj_d3 = self._make_skip_pyramid(in_ch=1024, out_ch=c3, up_steps=3)  # 14 -> 112
+                self.skip_attn_d1 = build_skip_attention(self.skip_attention, channels=c1, reduction=self.skip_attention_reduction)
+                self.skip_attn_d2 = build_skip_attention(self.skip_attention, channels=c2, reduction=self.skip_attention_reduction)
+                self.skip_attn_d3 = build_skip_attention(self.skip_attention, channels=c3, reduction=self.skip_attention_reduction)
+            if self.decoder_arch == "fundu":
+                # Fundu path handles decoding with mask-transformer + progressive post-adapter.
+                pass
+            elif self.decoder_arch == "transunet":
+                # TransUNet-like decoder cup over RETFound tokens:
+                # bottleneck conv_more (1024->512) then decoder channels (256,128,64,16).
+                self.transunet_conv_more = nn.Sequential(
+                    nn.Conv2d(1024, 512, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(512),
+                    nn.ReLU(inplace=True),
+                )
+                self.d1 = TransUNetDecoderBlock(in_channels=512, out_channels=256, skip_channels=c1)
+                self.d2 = TransUNetDecoderBlock(in_channels=256, out_channels=128, skip_channels=c2)
+                self.d3 = TransUNetDecoderBlock(in_channels=128, out_channels=64, skip_channels=c3)
+                self.d4 = TransUNetDecoderBlock(in_channels=64, out_channels=16, skip_channels=0)
+                self.d2_out_channels = 128
+                self.d3_out_channels = 64
+                self.decoder_out_channels = 16
+                print(
+                    f"🧱 Decoder arch=transunet | conv_more=1024->512, decoder=(256,128,64,16), "
+                    f"hybrid_skips={self.transunet_hybrid_skips} channels=({c1},{c2},{c3})"
+                )
+                if self.transunet_hybrid_skips:
+                    print(
+                        f"🧱 TransUNet hybrid skips: ResNet50(pretrained={self.transunet_r50_pretrained}, "
+                        f"frozen={self.transunet_freeze_r50})"
+                    )
+            else:
+                self.d1 = DecoderBlock([1024, c1], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+                self.d2 = DecoderBlock([512, c2], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+                self.d3 = DecoderBlock([256, c3], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+                self.d4 = DecoderBlock([128, 64], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+                self.d2_out_channels = 256
+                self.d3_out_channels = 128
+                self.decoder_out_channels = 64
+            if self.decoder_arch != "fundu":
+                print(
+                    f"🧬 Token-pyramid skips | channels=({c1},{c2},{c3}) "
+                    f"attention={self.skip_attention} reduction={self.skip_attention_reduction} "
+                    f"force_bilinear={self.force_bilinear_decoder}"
+                )
         else:
             self.d1 = DecoderBlock([1024, 1024], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
             self.d2 = DecoderBlock([512, 1024], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
             self.d3 = DecoderBlock([256, 1024], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
             self.d4 = DecoderBlock([128, 1024], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d2_out_channels = 256
+            self.d3_out_channels = 128
+            self.decoder_out_channels = 64
 
         if self.use_shallow_stem_fusion:
+            shallow_d3_channels = self.d3_out_channels
+            shallow_d4_channels = self.decoder_out_channels
             self.shallow_stem = nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=3, padding=1),
+                nn.Conv2d(self.input_channels, 32, kernel_size=3, padding=1),
                 nn.BatchNorm2d(32),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(32, 64, kernel_size=3, padding=1),
@@ -682,22 +1572,22 @@ class AttentionUNetViT(nn.Module):
             )
             self.shallow_to_d3 = nn.Sequential(
                 nn.AvgPool2d(kernel_size=2, stride=2),  # 224 -> 112
-                nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                nn.BatchNorm2d(128),
+                nn.Conv2d(64, shallow_d3_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(shallow_d3_channels),
                 nn.ReLU(inplace=True),
             )
             self.shallow_to_d4 = nn.Sequential(
-                nn.Conv2d(64, 64, kernel_size=3, padding=1),
-                nn.BatchNorm2d(64),
+                nn.Conv2d(64, shallow_d4_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(shallow_d4_channels),
                 nn.ReLU(inplace=True),
             )
 
         if self.deep_supervision:
-            self.aux_head_d2 = nn.Conv2d(256, config["num_classes"], kernel_size=1)
-            self.aux_head_d3 = nn.Conv2d(128, config["num_classes"], kernel_size=1)
+            self.aux_head_d2 = nn.Conv2d(self.d2_out_channels, config["num_classes"], kernel_size=1)
+            self.aux_head_d3 = nn.Conv2d(self.d3_out_channels, config["num_classes"], kernel_size=1)
         if self.use_post_refine:
             self.output = PostRefineHead(
-                in_ch=64,
+                in_ch=self.decoder_out_channels,
                 hidden_ch=int(config.get("post_refine_channels", 64)),
                 num_classes=config["num_classes"],
                 depth=int(config.get("post_refine_depth", 2)),
@@ -707,7 +1597,7 @@ class AttentionUNetViT(nn.Module):
                 f"hidden_ch={int(config.get('post_refine_channels', 64))}"
             )
         else:
-            self.output = nn.Conv2d(64, config["num_classes"], kernel_size=1, padding=0)
+            self.output = nn.Conv2d(self.decoder_out_channels, config["num_classes"], kernel_size=1, padding=0)
 
     @staticmethod
     def _make_skip_pyramid(in_ch, out_ch, up_steps):
@@ -756,6 +1646,9 @@ class AttentionUNetViT(nn.Module):
 
     def forward(self, x):
         x_in = x
+        if self.pre_adapter is not None:
+            x = self.pre_adapter(x_in)
+        x_for_hybrid_skips = x
         batch_size = x.shape[0]
         x = self.encoder.patch_embed(x)  # [B, N, C]
         cls_token = self.encoder.cls_token.expand(batch_size, -1, -1)
@@ -765,23 +1658,47 @@ class AttentionUNetViT(nn.Module):
         x = self.encoder.pos_drop(x)
         skip_connections = []
         for i, blk in enumerate(self.encoder.blocks):
+            key = str(i)
+            if self.enable_encoder_adapters and self.adapter_placement == "pre" and key in self.encoder_adapters:
+                x = self.encoder_adapters[key](x)
             x = blk(x)
-            if self.enable_encoder_adapters:
-                key = str(i)
-                if key in self.encoder_adapters:
-                    x = self.encoder_adapters[key](x)
+            if self.enable_encoder_adapters and self.adapter_placement == "post" and key in self.encoder_adapters:
+                x = self.encoder_adapters[key](x)
             if i in [5, 11, 17, 23]:
                 skip_connections.append(x[:, 1:, :])  # drop cls token
-        z6, z12, z18, z24 = skip_connections
-        z6 = self._tokens_to_feature_map(z6)
-        z12 = self._tokens_to_feature_map(z12)
-        z18 = self._tokens_to_feature_map(z18)
-        z24 = self._tokens_to_feature_map(z24)
+        z6_tokens, z12_tokens, z18_tokens, z24_tokens = skip_connections
+        z6 = self._tokens_to_feature_map(z6_tokens)
+        z12 = self._tokens_to_feature_map(z12_tokens)
+        z18 = self._tokens_to_feature_map(z18_tokens)
+        z24 = self._tokens_to_feature_map(z24_tokens)
+
+        if self.decoder_arch == "fundu":
+            if self.fundu_mask_decoder is None or self.fundu_post_adapter is None:
+                raise RuntimeError("decoder_arch=fundu is selected, but Fundu decoder modules are not initialized.")
+            mask_14 = self.fundu_mask_decoder(z24_tokens)  # [B, C, 14, 14]
+            s28 = self.fundu_skip_28(z24)
+            s56 = self.fundu_skip_56(z18)
+            s112 = self.fundu_skip_112(z12)
+            s224 = self.fundu_skip_224(z6)
+            main_output = self.fundu_post_adapter(mask_14, s28, s56, s112, s224)
+            if main_output.shape[-2:] != x_in.shape[-2:]:
+                main_output = F.interpolate(main_output, size=x_in.shape[-2:], mode='bilinear', align_corners=True)
+            return main_output
+
         if self.multiscale_skip_mode == "token_pyramid":
-            s1 = self.skip_proj_d1(z18)
-            s2 = self.skip_proj_d2(z12)
-            s3 = self.skip_proj_d3(z6)
-            x = self.d1(z24, s1)
+            if self.decoder_arch == "transunet" and self.transunet_hybrid_skips and self.transunet_hybrid_skip_net is not None:
+                # Strict TransUNet-style hybrid skips from CNN backbone.
+                s1, s2, s3 = self.transunet_hybrid_skip_net(x_for_hybrid_skips)
+            else:
+                s1 = self.skip_proj_d1(z18)
+                s2 = self.skip_proj_d2(z12)
+                s3 = self.skip_proj_d3(z6)
+                # Apply optional skip-attention (SE/CBAM) after projection and before decoder fusion.
+                s1 = self.skip_attn_d1(s1)
+                s2 = self.skip_attn_d2(s2)
+                s3 = self.skip_attn_d3(s3)
+            z24_in = self.transunet_conv_more(z24) if self.transunet_conv_more is not None else z24
+            x = self.d1(z24_in, s1)
             d2 = self.d2(x, s2)
             d3 = self.d3(d2, s3)
         else:
@@ -803,20 +1720,22 @@ class AttentionUNetViT(nn.Module):
                 s_d4 = F.interpolate(s_d4, size=d4.shape[-2:], mode='bilinear', align_corners=True)
             d4 = d4 + s_d4
 
-        output = self.output(d4)
+        main_output = self.output(d4)
+        if main_output.shape[-2:] != x_in.shape[-2:]:
+            main_output = F.interpolate(main_output, size=x_in.shape[-2:], mode='bilinear', align_corners=True)
         if self.deep_supervision:
             aux_d2 = self.aux_head_d2(d2)
             aux_d3 = self.aux_head_d3(d3)
-            if aux_d2.shape[-2:] != output.shape[-2:]:
-                aux_d2 = F.interpolate(aux_d2, size=output.shape[-2:], mode='bilinear', align_corners=False)
-            if aux_d3.shape[-2:] != output.shape[-2:]:
-                aux_d3 = F.interpolate(aux_d3, size=output.shape[-2:], mode='bilinear', align_corners=False)
+            if aux_d2.shape[-2:] != main_output.shape[-2:]:
+                aux_d2 = F.interpolate(aux_d2, size=main_output.shape[-2:], mode='bilinear', align_corners=False)
+            if aux_d3.shape[-2:] != main_output.shape[-2:]:
+                aux_d3 = F.interpolate(aux_d3, size=main_output.shape[-2:], mode='bilinear', align_corners=False)
             return {
-                "main": output,
+                "main": main_output,
                 "aux_d2": aux_d2,
                 "aux_d3": aux_d3,
             }
-        return output
+        return main_output
 
 # Tversky Loss (Aligned with root code)
 class TverskyLoss(nn.Module):
@@ -954,19 +1873,6 @@ def compute_total_loss(
     return loss
 
 # Boundary Detection and Error Computation
-def find_boundaries(mask):
-    upper_boundaries = []
-    lower_boundaries = []
-    for col in range(mask.shape[1]):
-        non_zero_indices = np.where(mask[:, col] > 0)[0]
-        if len(non_zero_indices) > 0:
-            upper_boundaries.append(non_zero_indices[0])
-            lower_boundaries.append(non_zero_indices[-1])
-        else:
-            upper_boundaries.append(None)
-            lower_boundaries.append(None)
-    return upper_boundaries, lower_boundaries
-
 def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
     signed_errors = []
     unsigned_errors = []
@@ -997,7 +1903,10 @@ def plot_boundaries(images, true_masks, predicted_masks, threshold):
     batch_size = images.size(0)
 
     for i in range(batch_size):
-        image = images[i].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format for RGB
+        image = images[i].cpu().numpy().transpose(1, 2, 0)
+        if image.shape[-1] == 1:
+            # Grayscale pipeline: expand to pseudo-RGB so boundary colors can be drawn.
+            image = np.repeat(image, 3, axis=2)
         true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
         predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
 
@@ -1060,24 +1969,83 @@ class JointSegmentationTransform:
         augment=False,
         normalize=False,
         num_classes=2,
+        image_mode='rgb',
         random_resized_crop=True,
-        crop_scale_min=0.8,
-        hflip_prob=0.5,
-        rotation_deg=15.0,
+        crop_scale_min=0.9,
+        hflip_prob=0.2,
+        rotation_deg=8.0,
         color_jitter=True,
+        oct_intensity_aug=False,
+        oct_brightness_jitter=0.1,
+        oct_contrast_jitter=0.1,
+        oct_gamma_min=0.9,
+        oct_gamma_max=1.1,
+        oct_speckle_prob=0.25,
+        oct_speckle_std_min=0.03,
+        oct_speckle_std_max=0.07,
+        oct_noise_prob=0.2,
+        oct_noise_std_min=0.005,
+        oct_noise_std_max=0.015,
+        oct_blur_prob=0.1,
+        oct_blur_sigma_max=0.6,
     ):
         self.image_size = int(image_size)
         self.augment = bool(augment)
         self.normalize = bool(normalize)
         self.num_classes = int(num_classes)
+        self.image_mode = str(image_mode).strip().lower()
+        if self.image_mode not in {'rgb', 'gray'}:
+            raise ValueError(f"image_mode must be 'rgb' or 'gray', got {image_mode}")
         self.random_resized_crop = bool(random_resized_crop)
         self.crop_scale_min = float(crop_scale_min)
         self.hflip_prob = float(hflip_prob)
         self.rotation_deg = float(rotation_deg)
         self.color_jitter_enabled = bool(color_jitter)
         self.color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2)
-        self.mean = [0.485, 0.456, 0.406]
-        self.std = [0.229, 0.224, 0.225]
+        self.oct_intensity_aug = bool(oct_intensity_aug)
+        self.oct_brightness_jitter = float(oct_brightness_jitter)
+        self.oct_contrast_jitter = float(oct_contrast_jitter)
+        self.oct_gamma_min = float(oct_gamma_min)
+        self.oct_gamma_max = float(oct_gamma_max)
+        self.oct_speckle_prob = float(oct_speckle_prob)
+        self.oct_speckle_std_min = float(oct_speckle_std_min)
+        self.oct_speckle_std_max = float(oct_speckle_std_max)
+        self.oct_noise_prob = float(oct_noise_prob)
+        self.oct_noise_std_min = float(oct_noise_std_min)
+        self.oct_noise_std_max = float(oct_noise_std_max)
+        self.oct_blur_prob = float(oct_blur_prob)
+        self.oct_blur_sigma_max = float(oct_blur_sigma_max)
+        if self.image_mode == 'gray':
+            self.mean = [0.5]
+            self.std = [0.5]
+        else:
+            self.mean = [0.485, 0.456, 0.406]
+            self.std = [0.229, 0.224, 0.225]
+
+    def _apply_oct_intensity_aug(self, image_t):
+        b = 1.0 + random.uniform(-self.oct_brightness_jitter, self.oct_brightness_jitter)
+        c = 1.0 + random.uniform(-self.oct_contrast_jitter, self.oct_contrast_jitter)
+        image_t = TF.adjust_brightness(image_t, b)
+        image_t = TF.adjust_contrast(image_t, c)
+        gamma = random.uniform(self.oct_gamma_min, self.oct_gamma_max)
+        image_t = TF.adjust_gamma(image_t, gamma=gamma, gain=1.0)
+
+        if random.random() < self.oct_speckle_prob:
+            sigma = random.uniform(self.oct_speckle_std_min, self.oct_speckle_std_max)
+            image_t = image_t * (1.0 + sigma * torch.randn_like(image_t))
+
+        if random.random() < self.oct_noise_prob:
+            sigma = random.uniform(self.oct_noise_std_min, self.oct_noise_std_max)
+            image_t = image_t + sigma * torch.randn_like(image_t)
+
+        if random.random() < self.oct_blur_prob and self.oct_blur_sigma_max > 0.0:
+            sigma = random.uniform(0.1, self.oct_blur_sigma_max)
+            k = max(3, int(2 * round(3 * sigma) + 1))
+            if k % 2 == 0:
+                k += 1
+            image_t = TF.gaussian_blur(image_t, kernel_size=[k, k], sigma=[sigma, sigma])
+
+        return image_t.clamp(0.0, 1.0)
 
     def __call__(self, image, mask=None):
         image = TF.resize(image, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
@@ -1110,6 +2078,8 @@ class JointSegmentationTransform:
                 image = self.color_jitter(image)
 
         image_t = TF.to_tensor(image)
+        if self.augment and mask is not None and self.oct_intensity_aug:
+            image_t = self._apply_oct_intensity_aug(image_t)
         if self.normalize:
             image_t = TF.normalize(image_t, mean=self.mean, std=self.std)
 
@@ -1124,6 +2094,8 @@ class JointSegmentationTransform:
 
 _imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 _img_eval_ops = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor()]
+if args.image_mode == 'gray':
+    _imagenet_norm = transforms.Normalize(mean=[0.5], std=[0.5])
 if args.normalize_imagenet:
     _img_eval_ops.append(_imagenet_norm)
 image_only_transform = transforms.Compose(_img_eval_ops)
@@ -1133,17 +2105,32 @@ train_transform = JointSegmentationTransform(
     augment=True,
     normalize=args.normalize_imagenet,
     num_classes=2,
+    image_mode=args.image_mode,
     random_resized_crop=args.augment_random_resized_crop,
     crop_scale_min=args.augment_scale_min,
     hflip_prob=args.augment_hflip_prob,
     rotation_deg=args.augment_rotation_deg,
     color_jitter=args.augment_color_jitter,
+    oct_intensity_aug=args.oct_intensity_aug,
+    oct_brightness_jitter=args.oct_brightness_jitter,
+    oct_contrast_jitter=args.oct_contrast_jitter,
+    oct_gamma_min=args.oct_gamma_min,
+    oct_gamma_max=args.oct_gamma_max,
+    oct_speckle_prob=args.oct_speckle_prob,
+    oct_speckle_std_min=args.oct_speckle_std_min,
+    oct_speckle_std_max=args.oct_speckle_std_max,
+    oct_noise_prob=args.oct_noise_prob,
+    oct_noise_std_min=args.oct_noise_std_min,
+    oct_noise_std_max=args.oct_noise_std_max,
+    oct_blur_prob=args.oct_blur_prob,
+    oct_blur_sigma_max=args.oct_blur_sigma_max,
 )
 val_test_transform = JointSegmentationTransform(
     image_size=args.image_size,
     augment=False,
     normalize=args.normalize_imagenet,
     num_classes=2,
+    image_mode=args.image_mode,
 )
 def save_segmentation_results(filenames, original_sizes, predicted_masks, output_dir, segment_dir, save_overlay=False, threshold=0.5):
     """
@@ -1374,7 +2361,8 @@ def train_fold(
     if os.path.exists(save_best_path):
         ckpt = torch.load(save_best_path, map_location=device, weights_only=False)
         state_dict = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
-        model.load_state_dict(state_dict, strict=False)
+        state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=config["num_channels"])
+        load_state_dict_flexible(model, state_dict)
         print(f"🔁 Loaded best checkpoint for final evaluation: {save_best_path}")
 
     # — after all epochs, run full evaluation on validation & test sets as before —
@@ -1450,9 +2438,12 @@ def append_ablation_results(csv_path, preset, save_best_path, metrics):
 
 
 class OCTSegmentationDataset(torch.utils.data.Dataset):
-    def __init__(self, image_dir, image_size, transform=None):
+    def __init__(self, image_dir, image_size, transform=None, image_mode='rgb'):
         self.image_size = image_size
         self.transform = transform
+        self.image_mode = str(image_mode).strip().lower()
+        if self.image_mode not in {'rgb', 'gray'}:
+            raise ValueError(f"image_mode must be 'rgb' or 'gray', got {image_mode}")
         # Supported extensions
         exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
         # Build list of image paths
@@ -1469,7 +2460,8 @@ class OCTSegmentationDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        image = Image.open(img_path).convert('RGB')
+        pil_mode = 'L' if self.image_mode == 'gray' else 'RGB'
+        image = Image.open(img_path).convert(pil_mode)
         original_size = image.size  # This returns (width, height)
         if self.transform:
             image = self.transform(image)
@@ -1504,7 +2496,8 @@ if __name__ == '__main__':
         segment_dataset = OCTSegmentationDataset(
             args.segment_dir,
             args.image_size,
-            transform=image_only_transform
+            transform=image_only_transform,
+            image_mode=args.image_mode,
         )
         
         # Custom collate function to handle original sizes as tuples
@@ -1536,7 +2529,8 @@ if __name__ == '__main__':
             else:
                 state_dict = checkpoint
                 
-            model.load_state_dict(state_dict, strict=False)
+            state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=config["num_channels"])
+            load_state_dict_flexible(model, state_dict)
             print(f"✅ Loaded weights from {config['retfound_weights_path']}")
         else:
             print(f"❌ Error: Weight file not found at {config['retfound_weights_path']}")
@@ -1603,7 +2597,8 @@ if __name__ == '__main__':
         else:
             state_dict = checkpoint
             
-        model.load_state_dict(state_dict, strict=False)
+        state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=config["num_channels"])
+        load_state_dict_flexible(model, state_dict)
         print(f"✅ Loaded weights from {config['retfound_weights_path']}")
     
     # Setup training components
@@ -1641,6 +2636,7 @@ if __name__ == '__main__':
             args.image_size,
             transform=train_transform,
             num_classes=2,
+            image_mode=args.image_mode,
         )
         valid_dataset = OCTDataset(
             args.val_image_dir,
@@ -1648,13 +2644,21 @@ if __name__ == '__main__':
             args.image_size,
             transform=val_test_transform,
             num_classes=2,
+            image_mode=args.image_mode,
         )
         # Keep a test loader object for visualization code-path compatibility.
         test_dataset = valid_dataset
         split_policy_msg = "explicit-fold (train dirs + val dirs)"
     else:
         # Prepare datasets (split by indices to keep train/eval transforms isolated).
-        full_dataset_eval = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=val_test_transform, num_classes=2)
+        full_dataset_eval = OCTDataset(
+            args.image_dir,
+            args.mask_dir,
+            args.image_size,
+            transform=val_test_transform,
+            num_classes=2,
+            image_mode=args.image_mode,
+        )
         if not (0.0 < args.test_split < 1.0):
             raise ValueError(f"--test_split must be in (0,1), got {args.test_split}")
         if not (0.0 < args.val_split_in_trainval < 1.0):
@@ -1673,7 +2677,14 @@ if __name__ == '__main__':
         valid_indices = indices[train_size:train_size + valid_size]
         test_indices = indices[train_size + valid_size:]
 
-        full_dataset_train = OCTDataset(args.image_dir, args.mask_dir, args.image_size, transform=train_transform, num_classes=2)
+        full_dataset_train = OCTDataset(
+            args.image_dir,
+            args.mask_dir,
+            args.image_size,
+            transform=train_transform,
+            num_classes=2,
+            image_mode=args.image_mode,
+        )
         train_dataset = Subset(full_dataset_train, train_indices)
         valid_dataset = Subset(full_dataset_eval, valid_indices)
         test_dataset = Subset(full_dataset_eval, test_indices)
@@ -1707,6 +2718,7 @@ if __name__ == '__main__':
     print(f"   • Validation samples: {len(valid_dataset)}")
     print(f"   • Test samples: {len(test_dataset)}")
     print(f"   • Split policy: {split_policy_msg}")
+    print(f"   • Image mode/channels: {args.image_mode}/{config['num_channels']}")
     print(f"   • LR: {args.lr}")
     print(f"   • Optimizer: {args.optimizer}")
     print(f"   • Weight decay: {args.weight_decay}")
@@ -1714,6 +2726,17 @@ if __name__ == '__main__':
     print(f"   • Class weights: {class_weights}")
     print(f"   • Loss mode: {args.loss_mode}")
     print(f"   • Edge loss weight: {args.edge_loss_weight}")
+    print(f"   • Decoder architecture: {args.decoder_arch}")
+    if args.decoder_arch == "transunet":
+        print(
+            f"   • TransUNet hybrid skips (R50): {args.transunet_hybrid_skips} "
+            f"(pretrained={args.transunet_r50_pretrained}, freeze={args.transunet_freeze_r50})"
+        )
+    if args.decoder_arch == "fundu":
+        print(
+            f"   • Fundu mask-decoder layers: {args.fundu_decoder_layers} "
+            f"(Segmenter-style mask transformer + progressive post-adapter)"
+        )
     print(f"   • Multiscale skip mode: {args.multiscale_skip_mode}")
     print(
         f"   • Post-refine head: {args.use_post_refine} "
@@ -1722,6 +2745,21 @@ if __name__ == '__main__':
     print(f"   • Shallow stem fusion: {args.use_shallow_stem_fusion}")
     print(f"   • Deep supervision: {args.deep_supervision} (w_d2={args.aux_weight_d2}, w_d3={args.aux_weight_d3})")
     print(f"   • ImageNet normalization: {args.normalize_imagenet}")
+    print(
+        f"   • Pre-adapter: {args.use_pre_adapter} "
+        f"(target={args.pre_adapter_target_size}, hidden={args.pre_adapter_hidden_channels}, "
+        f"depth={args.pre_adapter_depth}, norm={args.pre_adapter_norm}, mode={args.pre_adapter_mode}, "
+        f"res_scale_init={args.pre_adapter_residual_scale_init}, "
+        f"rgb_scalars={args.pre_adapter_rgb_scalars})"
+    )
+    print(
+        f"   • OCT intensity aug: {args.oct_intensity_aug} "
+        f"(b={args.oct_brightness_jitter}, c={args.oct_contrast_jitter}, "
+        f"gamma=[{args.oct_gamma_min},{args.oct_gamma_max}], "
+        f"speckle_p/std=[{args.oct_speckle_prob},{args.oct_speckle_std_min}-{args.oct_speckle_std_max}], "
+        f"noise_p/std=[{args.oct_noise_prob},{args.oct_noise_std_min}-{args.oct_noise_std_max}], "
+        f"blur_p/smax=[{args.oct_blur_prob},{args.oct_blur_sigma_max}])"
+    )
     print(
         f"   • Augment: crop={args.augment_random_resized_crop}(scale_min={args.augment_scale_min}), "
         f"hflip_p={args.augment_hflip_prob}, rot={args.augment_rotation_deg}, jitter={args.augment_color_jitter}"
@@ -1734,7 +2772,8 @@ if __name__ == '__main__':
     print(
         f"   • Encoder adapters: {args.enable_encoder_adapters} "
         f"(rank={args.adapter_rank}, blocks='{args.adapter_blocks}', "
-        f"dropout={args.adapter_dropout}, init_scale={args.adapter_init_scale})"
+        f"dropout={args.adapter_dropout}, init_scale={args.adapter_init_scale}, "
+        f"placement={args.adapter_placement})"
     )
     print(f"   • Early stopping patience/min_delta: {args.early_stopping_patience}/{args.early_stopping_min_delta}")
     print(f"   • Best checkpoint path: {save_best_path}")

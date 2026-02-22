@@ -5,10 +5,13 @@ import torch
 import torch.nn.functional as F
 
 class OCTDataset(torch.utils.data.Dataset):
-    def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2):
+    def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2, image_mode='rgb'):
         self.image_size  = image_size
         self.transform   = transform
         self.num_classes = num_classes
+        self.image_mode = str(image_mode).strip().lower()
+        if self.image_mode not in {'rgb', 'gray'}:
+            raise ValueError(f"image_mode must be 'rgb' or 'gray', got {image_mode}")
 
         # Supported extensions
         exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
@@ -20,12 +23,20 @@ class OCTDataset(torch.utils.data.Dataset):
             if ext.lower() in exts:
                 image_map[base] = fname
 
-        # Build mapping from basename → filename for masks
+        # Build mapping from basename → filename for masks.
+        # Supports both exact stem matches and "<stem>_mask" naming.
         mask_map = {}
         for fname in os.listdir(mask_dir):
             base, ext = os.path.splitext(fname)
             if ext.lower() in exts:
-                mask_map[base] = fname
+                # Exact key
+                if base not in mask_map:
+                    mask_map[base] = fname
+                # Common pattern: image stem + "_mask"
+                if base.endswith('_mask'):
+                    base_stripped = base[:-5]
+                    if base_stripped and base_stripped not in mask_map:
+                        mask_map[base_stripped] = fname
 
         # Keep only basenames present in both
         common_bases = sorted(set(image_map.keys()) & set(mask_map.keys()))
@@ -43,29 +54,22 @@ class OCTDataset(torch.utils.data.Dataset):
         mask_path = self.mask_paths[idx]
 
         # load
-        image    = Image.open(img_path).convert('RGB')
+        pil_mode = 'L' if self.image_mode == 'gray' else 'RGB'
+        image    = Image.open(img_path).convert(pil_mode)
         mask_pil = Image.open(mask_path).convert('L')
-
-        # binarize mask on any non-zero pixel
-        mask_np = np.array(mask_pil)
-        mask_np = (mask_np > 0).astype(np.uint8)
-
-        # apply image transform if given
         if self.transform:
-            image = self.transform(image)
+            # Preferred path: joint image/mask transform.
+            try:
+                image_t, mask_t = self.transform(image, mask_pil)
+                return image_t, mask_t
+            except TypeError:
+                # Backward-compatible path: image-only transform.
+                image = self.transform(image)
 
-        # resize mask
-        mask_pil = Image.fromarray(mask_np)
-        mask_pil = mask_pil.resize(
-            (self.image_size, self.image_size),
-            resample=Image.NEAREST
-        )
+        # Fallback path (no transform or image-only transform): resize + one-hot mask here.
+        mask_np = (np.array(mask_pil) > 0).astype(np.uint8)
+        mask_pil = Image.fromarray(mask_np).resize((self.image_size, self.image_size), resample=Image.NEAREST)
         mask_np = np.array(mask_pil)
-
-        # one-hot encode
         mask_tensor = torch.from_numpy(mask_np).long()
-        mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes)
-        mask_onehot = mask_onehot.permute(2, 0, 1).float()
-
+        mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes).permute(2, 0, 1).float()
         return image, mask_onehot
-

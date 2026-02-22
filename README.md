@@ -2,11 +2,13 @@
 
 **RFA-U-Net** is a deep learning model to segment the **choroid** in Optical Coherence Tomography (OCT) images. It uses a **RETFound**-pretrained Vision Transformer (ViT) encoder and an **Attention U-Net** decoder, trained with Tversky/Dice losses and evaluated via Dice scores and micrometer-scale boundary errors.
 
-**Last updated: 2026-02-11**
+**Last updated: 2026-02-22**
 🆕 New:
 * **Segmentation-only mode** for unlabeled OCT images via `--segment_dir` (no masks needed)
 * **Unified CNN/SOTA training and evaluation runner** via `src/cnn_sota_unet_models.py`
 * **RFA-U-Net ablation-study presets** in `src/rfa_u_net.py` via `--ablation_preset`
+* **OCT pre-adapter + true grayscale pipeline** in `src/rfa_u_net.py` / `src/dataset.py`
+  * Helps stabilize **multi-device / multi-scanner OCT** variation (especially **contrast / brightness** shift) before RETFound patch embedding
 
 ---
 
@@ -14,6 +16,10 @@
 
 * **Encoder**: RETFound MAE ViT backbone
 * **Decoder**: Attention U-Net with gated skip connections
+* **🆕 OCT pre-adapter (optional, recommended)**:
+  * `--use_pre_adapter --pre_adapter_mode gray_edge --pre_adapter_norm in`
+  * Adds anti-aliased resize + OCT-oriented intensity correction + edge-preserving input alignment before RETFound
+  * Improves robustness to scanner/domain intensity shifts (contrast/brightness differences)
 * **Losses**: Tversky + Dice to handle class imbalance
 * **Metrics**:
 
@@ -162,6 +168,10 @@ python src/rfa_u_net.py \
   --image_dir data/images \
   --mask_dir  data/masks \
   --weights_type retfound \
+  --image_mode gray \
+  --use_pre_adapter \
+  --pre_adapter_mode gray_edge \
+  --pre_adapter_norm in \
   --num_epochs 20 \
   --batch_size 8
 ```
@@ -171,6 +181,29 @@ This will:
 * Download **RETFound** weights from HF Hub if missing
 * Initialize the ViT encoder from RETFound
 * Train the Attention U-Net decoder on your dataset
+
+### 2b️⃣ Recommended OCT scanner-robust RETFound setup (contrast/brightness shift)
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir data/masks \
+  --weights_type retfound \
+  --image_mode gray \
+  --use_pre_adapter \
+  --pre_adapter_mode gray_edge \
+  --pre_adapter_norm in \
+  --pre_adapter_hidden_channels 8 \
+  --pre_adapter_depth 1 \
+  --pre_adapter_residual_scale_init 0.10 \
+  --num_epochs 50 \
+  --batch_size 8
+```
+
+Why this helps:
+* The **pre-adapter** reduces scanner-dependent **contrast/brightness** mismatch before tokenization.
+* `gray_edge` mode preserves boundary cues (important for thin choroid interfaces).
+* The **true grayscale pipeline** (`--image_mode gray`) avoids redundant replicated RGB channels for OCT.
 
 ### 3️⃣ Fine-tune with pre-trained RFA-U-Net weights
 
@@ -458,6 +491,13 @@ Segmentation-only mode also creates overlay PNGs directly from your unlabeled OC
 ---
 
 ## 📝 Changelog
+
+* **2026-02-22**
+
+  * Added **OCT pre-adapter** documentation (`--use_pre_adapter`, `--pre_adapter_mode gray_edge`, `--pre_adapter_norm in`)
+  * Documented pre-adapter rationale for **multi-device / multi-scanner OCT** robustness (contrast / brightness shift)
+  * Added **true grayscale pipeline** usage (`--image_mode gray`) for OCT training/inference
+  * Updated README examples to reflect current RETFound + OCT-pre-adapter usage
 
 * **2026-02-11**
 
