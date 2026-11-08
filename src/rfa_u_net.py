@@ -60,14 +60,15 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 from PIL import Image
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
 from timm.layers import drop_path, to_2tuple, trunc_normal_
 import models_vit
 from util.pos_embed import interpolate_pos_embed
 import argparse
 import sys
 import csv
+import pickle
+import tempfile
+import zipfile
 from datetime import datetime
 try:
     import gdown
@@ -75,7 +76,11 @@ except Exception:
     gdown = None
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
-from dataset import OCTDataset
+from dataset import OCTDataset, image_paths, index_by_stem, load_scan
+from choroid import (
+    column_bounds, metadata_for, native_mask, read_metadata, scan_metrics, split_patients,
+    summarize_scans, thickness_loss_choroid, thickness_measurements,
+)
 
 
 ABLATION_PRESETS = {
@@ -111,6 +116,7 @@ def resolve_ablation_flags(preset: str):
 
 
 def set_seed(seed: int):
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -215,8 +221,8 @@ def adapt_patch_embed_in_channels(state_dict, target_in_channels: int):
     if src_in == tgt_in:
         return state_dict
     if src_in == 3 and tgt_in == 1:
-        state_dict[key] = w.mean(dim=1, keepdim=True)
-        print("🔁 Adapted patch_embed weights from 3-channel to 1-channel (mean over RGB).")
+        state_dict[key] = w.sum(dim=1, keepdim=True)
+        print("🔁 Adapted patch_embed weights from 3-channel to 1-channel (sum over RGB).")
         return state_dict
     if src_in == 1 and tgt_in == 3:
         state_dict[key] = w.repeat(1, 3, 1, 1) / 3.0
@@ -260,13 +266,13 @@ def download_retfound_weights_hf(repo_id: str, filename: str, cache_dir: str = "
     except RepositoryNotFoundError as e:
         raise FileNotFoundError(f"Could not find {repo_id}/{filename} on HF. {e}")
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="RFA-U-Net for OCT Choroid Segmentation")
     parser.add_argument('--image_dir', type=str, required=False, help='Path to the directory containing OCT images (required for training)')
     parser.add_argument('--mask_dir', type=str, required=False, help='Path to the directory containing mask images (required for training)')
     parser.add_argument('--val_image_dir', type=str, default=None, help='Optional validation-image directory for explicit fold-based training')
     parser.add_argument('--val_mask_dir', type=str, default=None, help='Optional validation-mask directory for explicit fold-based training')
-    parser.add_argument('--weights_path', type=str, default='weights/best_rfa_unet.pth',
+    parser.add_argument('--weights_path', type=str, default=None,
                         help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
     parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
                         help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
@@ -275,14 +281,20 @@ def parse_args():
                         help='Input image channel mode: gray uses true 1-channel pipeline; rgb keeps legacy 3-channel')
     parser.add_argument('--num_epochs', type=int, default=20, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
-    parser.add_argument('--num_workers', type=int, default=2, help='DataLoader worker count')
+    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader worker count (default 0 for portability)')
     parser.add_argument('--test_only', action='store_true', help='Run inference on external data without training')
     parser.add_argument('--test_image_dir', type=str, default=None, help='Path to external test images (required if --test_only)')
     parser.add_argument('--test_mask_dir', type=str, default=None, help='Path to external test masks (required if --test_only)')
     parser.add_argument('--segment_dir', type=str, default=None, help='Path to directory containing images to segment (no masks needed)')
     parser.add_argument('--output_dir', type=str, default='segment_results', help='Directory to save segmentation results')
     parser.add_argument('--save_overlay', action='store_true', help='Save overlay images with segmentation boundaries')
-    parser.add_argument('--pixel_size_micrometers', type=float, default=10.35, help='Pixel size in micrometers for boundary error computation')
+    parser.add_argument('--pixel_size_micrometers', type=float, default=None, help='Fallback native axial spacing in micrometers per pixel (otherwise report pixels)')
+    parser.add_argument('--metadata_csv', help='CSV with image, patient_id and optional scanner, axial_um_per_pixel')
+    parser.add_argument('--measurements_csv', help='Write per-scan axial thickness during --segment_dir inference')
+    parser.add_argument('--metrics_csv', help='Write native-resolution per-scan evaluation metrics')
+    parser.add_argument('--tta_hflip', action='store_true', help='Average original and horizontal-flip probabilities')
+    parser.add_argument('--postprocess', choices=['none', 'layer'], default='none',
+                        help='Optional largest connected choroid band with within-column hole filling')
     parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binarizing predicted masks')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible data split')
     parser.add_argument('--ablation_preset', type=str, default='full', choices=list(ABLATION_PRESETS.keys()),
@@ -300,8 +312,8 @@ def parse_args():
                         help='Weight decay (L2 regularization)')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gradient clipping max-norm (<=0 disables)')
-    parser.add_argument('--freeze_encoder_blocks', type=int, default=21,
-                        help='Freeze first N ViT encoder blocks when using pretrained weights')
+    parser.add_argument('--freeze_encoder_blocks', type=int, default=None,
+                        help='Freeze the first N encoder blocks (default 21 for pretrained weights, 0 otherwise)')
     parser.add_argument('--progressive_unfreeze_schedule', type=str, default='',
                         help='Optional schedule to change frozen block count by epoch, e.g. "1:24,10:21,20:18"')
     parser.add_argument('--enable_encoder_adapters', action='store_true',
@@ -332,6 +344,8 @@ def parse_args():
                         help='Loss target: both classes (weighted) or choroid class only')
     parser.add_argument('--edge_loss_weight', type=float, default=0.0,
                         help='Optional edge-aware Dice loss weight on choroid boundaries (0 disables)')
+    parser.add_argument('--thickness_loss_weight', type=float, default=0.0,
+                        help='Optional soft axial-thickness loss on labeled columns (0 disables)')
     parser.add_argument('--multiscale_skip_mode', type=str, default='legacy', choices=['legacy', 'token_pyramid'],
                         help='Skip construction mode: legacy direct-token skips, or learned token pyramid skips')
     parser.add_argument('--decoder_arch', type=str, default='rfa', choices=['rfa', 'transunet', 'fundu'],
@@ -450,224 +464,244 @@ def parse_args():
                         help='Held-out test fraction from full dataset (e.g., 0.2)')
     parser.add_argument('--val_split_in_trainval', type=float, default=0.2,
                         help='Validation fraction inside the remaining (1-test_split) subset')
-    return parser.parse_args()
-# Parse arguments
-args = parse_args()
+    return parser.parse_args(argv)
 
-if not (0.0 < args.augment_scale_min <= 1.0):
-    raise ValueError(f"--augment_scale_min must be in (0, 1], got {args.augment_scale_min}")
-if not (0.0 <= args.augment_hflip_prob <= 1.0):
-    raise ValueError(f"--augment_hflip_prob must be in [0, 1], got {args.augment_hflip_prob}")
-if args.augment_rotation_deg < 0:
-    raise ValueError(f"--augment_rotation_deg must be >= 0, got {args.augment_rotation_deg}")
-if args.edge_loss_weight < 0.0:
-    raise ValueError(f"--edge_loss_weight must be >= 0, got {args.edge_loss_weight}")
-if args.skip_standardize_channels < 0:
-    raise ValueError(f"--skip_standardize_channels must be >= 0, got {args.skip_standardize_channels}")
-if args.skip_attention not in {"none", "se", "cbam"}:
-    raise ValueError(f"--skip_attention must be one of ['none','se','cbam'], got {args.skip_attention}")
-if args.skip_attention_reduction < 1:
-    raise ValueError(f"--skip_attention_reduction must be >= 1, got {args.skip_attention_reduction}")
-if args.post_refine_depth < 1:
-    raise ValueError(f"--post_refine_depth must be >= 1, got {args.post_refine_depth}")
-if args.post_refine_channels < 1:
-    raise ValueError(f"--post_refine_channels must be >= 1, got {args.post_refine_channels}")
-if args.pre_adapter_target_size <= 0:
-    raise ValueError(f"--pre_adapter_target_size must be > 0, got {args.pre_adapter_target_size}")
-if args.pre_adapter_target_size % 16 != 0:
-    raise ValueError(
-        f"--pre_adapter_target_size must be divisible by 16 for ViT patching, got {args.pre_adapter_target_size}"
-    )
-if args.pre_adapter_hidden_channels < 1:
-    raise ValueError(f"--pre_adapter_hidden_channels must be >= 1, got {args.pre_adapter_hidden_channels}")
-if args.pre_adapter_depth < 1:
-    raise ValueError(f"--pre_adapter_depth must be >= 1, got {args.pre_adapter_depth}")
-if args.pre_adapter_norm not in {"in", "bn"}:
-    raise ValueError(f"--pre_adapter_norm must be one of ['in','bn'], got {args.pre_adapter_norm}")
-if args.pre_adapter_mode not in {"rgb_residual", "gray_edge"}:
-    raise ValueError(
-        f"--pre_adapter_mode must be one of ['rgb_residual','gray_edge'], got {args.pre_adapter_mode}"
-    )
-if args.pre_adapter_residual_scale_init < 0.0:
-    raise ValueError(
-        f"--pre_adapter_residual_scale_init must be >= 0, got {args.pre_adapter_residual_scale_init}"
-    )
-if args.enable_encoder_adapters and args.adapter_rank <= 0:
-    raise ValueError(f"--adapter_rank must be > 0, got {args.adapter_rank}")
-if not (0.0 <= args.adapter_dropout < 1.0):
-    raise ValueError(f"--adapter_dropout must be in [0, 1), got {args.adapter_dropout}")
-if args.adapter_init_scale < 0.0:
-    raise ValueError(f"--adapter_init_scale must be >= 0, got {args.adapter_init_scale}")
-if args.adapter_placement not in {"pre", "post"}:
-    raise ValueError(f"--adapter_placement must be one of ['pre','post'], got {args.adapter_placement}")
-if args.decoder_arch == "transunet" and args.multiscale_skip_mode != "token_pyramid":
-    print(
-        "[WARN] decoder_arch=transunet requires token_pyramid skips; overriding --multiscale_skip_mode to token_pyramid.",
-        file=sys.stderr,
-    )
-    args.multiscale_skip_mode = "token_pyramid"
-if args.decoder_arch == "transunet" and args.transunet_strict and args.skip_attention != "none":
-    print(
-        "[WARN] decoder_arch=transunet + strict mode uses plain skip fusion; overriding --skip_attention to 'none'.",
-        file=sys.stderr,
-    )
-    args.skip_attention = "none"
-if args.decoder_arch == "transunet" and args.transunet_strict and args.use_shallow_stem_fusion:
-    print(
-        "[WARN] decoder_arch=transunet + strict mode disables shallow stem fusion.",
-        file=sys.stderr,
-    )
-    args.use_shallow_stem_fusion = False
-if args.decoder_arch == "transunet" and args.transunet_strict and args.use_post_refine:
-    print(
-        "[WARN] decoder_arch=transunet + strict mode disables post-refine head.",
-        file=sys.stderr,
-    )
-    args.use_post_refine = False
-if args.decoder_arch == "transunet" and args.transunet_strict and args.deep_supervision:
-    print(
-        "[WARN] decoder_arch=transunet + strict mode disables deep supervision.",
-        file=sys.stderr,
-    )
-    args.deep_supervision = False
-if args.decoder_arch == "transunet" and not args.transunet_strict:
-    print(
-        "[INFO] decoder_arch=transunet with --no_transunet_strict: keeping user-configured skip_attention / shallow-stem / post-refine / deep-supervision.",
-        file=sys.stderr,
-    )
-if args.decoder_arch == "fundu" and args.multiscale_skip_mode != "token_pyramid":
-    print(
-        "[WARN] decoder_arch=fundu requires token_pyramid skips; overriding --multiscale_skip_mode to token_pyramid.",
-        file=sys.stderr,
-    )
-    args.multiscale_skip_mode = "token_pyramid"
-if args.decoder_arch == "fundu" and args.skip_attention != "cbam":
-    print(
-        "[WARN] decoder_arch=fundu uses CBAM skip attention by design; overriding --skip_attention to 'cbam'.",
-        file=sys.stderr,
-    )
-    args.skip_attention = "cbam"
-if args.decoder_arch == "fundu" and args.use_post_refine:
-    print(
-        "[WARN] decoder_arch=fundu already uses progressive post-adapter; disabling --use_post_refine.",
-        file=sys.stderr,
-    )
-    args.use_post_refine = False
-if args.decoder_arch == "fundu" and args.deep_supervision:
-    print(
-        "[WARN] decoder_arch=fundu disables deep supervision in current implementation.",
-        file=sys.stderr,
-    )
-    args.deep_supervision = False
-if args.decoder_arch == "fundu" and args.use_shallow_stem_fusion:
-    print(
-        "[WARN] decoder_arch=fundu disables shallow stem fusion to preserve Fundu-style decoder pathway.",
-        file=sys.stderr,
-    )
-    args.use_shallow_stem_fusion = False
-if args.decoder_arch == "fundu" and args.fundu_decoder_layers < 1:
-    raise ValueError(f"--fundu_decoder_layers must be >= 1, got {args.fundu_decoder_layers}")
-if not (0.0 <= args.oct_brightness_jitter <= 1.0):
-    raise ValueError(f"--oct_brightness_jitter must be in [0,1], got {args.oct_brightness_jitter}")
-if not (0.0 <= args.oct_contrast_jitter <= 1.0):
-    raise ValueError(f"--oct_contrast_jitter must be in [0,1], got {args.oct_contrast_jitter}")
-if not (0.0 < args.oct_gamma_min <= args.oct_gamma_max):
-    raise ValueError(
-        f"--oct_gamma_min/--oct_gamma_max invalid: min={args.oct_gamma_min}, max={args.oct_gamma_max}"
-    )
-if not (0.0 <= args.oct_speckle_prob <= 1.0):
-    raise ValueError(f"--oct_speckle_prob must be in [0,1], got {args.oct_speckle_prob}")
-if not (0.0 <= args.oct_noise_prob <= 1.0):
-    raise ValueError(f"--oct_noise_prob must be in [0,1], got {args.oct_noise_prob}")
-if not (0.0 <= args.oct_blur_prob <= 1.0):
-    raise ValueError(f"--oct_blur_prob must be in [0,1], got {args.oct_blur_prob}")
-if not (0.0 <= args.oct_speckle_std_min <= args.oct_speckle_std_max):
-    raise ValueError(
-        f"--oct_speckle_std_min/max invalid: min={args.oct_speckle_std_min}, max={args.oct_speckle_std_max}"
-    )
-if not (0.0 <= args.oct_noise_std_min <= args.oct_noise_std_max):
-    raise ValueError(
-        f"--oct_noise_std_min/max invalid: min={args.oct_noise_std_min}, max={args.oct_noise_std_max}"
-    )
-if args.oct_blur_sigma_max < 0.0:
-    raise ValueError(f"--oct_blur_sigma_max must be >= 0, got {args.oct_blur_sigma_max}")
-if args.use_pre_adapter and args.pre_adapter_residual_scale_init > 0.3:
-    print(
-        f"[WARN] pre-adapter residual init is high ({args.pre_adapter_residual_scale_init}). "
-        "For OCT boundary preservation, 0.05-0.15 is typically safer.",
-        file=sys.stderr,
-    )
-if args.use_pre_adapter and args.pre_adapter_norm == "in" and args.normalize_imagenet:
-    print(
-        "[WARN] Both input normalization and pre-adapter InstanceNorm are enabled; "
-        "this can over-normalize OCT intensity statistics.",
-        file=sys.stderr,
-    )
 
-if args.list_ablation_presets:
-    print("Available ablation presets:")
-    for preset_name, preset_flags in ABLATION_PRESETS.items():
-        print(
-            f"  - {preset_name}: "
-            f"attention={preset_flags['use_attention']}, "
-            f"fusion={preset_flags['use_fusion']}, "
-            f"upconvs={preset_flags['use_upconvs']}"
+def validate_args(args):
+    if not (0.0 < args.augment_scale_min <= 1.0):
+        raise ValueError(f"--augment_scale_min must be in (0, 1], got {args.augment_scale_min}")
+    if not (0.0 <= args.augment_hflip_prob <= 1.0):
+        raise ValueError(f"--augment_hflip_prob must be in [0, 1], got {args.augment_hflip_prob}")
+    if args.augment_rotation_deg < 0:
+        raise ValueError(f"--augment_rotation_deg must be >= 0, got {args.augment_rotation_deg}")
+    if args.edge_loss_weight < 0.0:
+        raise ValueError(f"--edge_loss_weight must be >= 0, got {args.edge_loss_weight}")
+    if args.skip_standardize_channels < 0:
+        raise ValueError(f"--skip_standardize_channels must be >= 0, got {args.skip_standardize_channels}")
+    if args.skip_attention not in {"none", "se", "cbam"}:
+        raise ValueError(f"--skip_attention must be one of ['none','se','cbam'], got {args.skip_attention}")
+    if args.skip_attention_reduction < 1:
+        raise ValueError(f"--skip_attention_reduction must be >= 1, got {args.skip_attention_reduction}")
+    if args.post_refine_depth < 1:
+        raise ValueError(f"--post_refine_depth must be >= 1, got {args.post_refine_depth}")
+    if args.post_refine_channels < 1:
+        raise ValueError(f"--post_refine_channels must be >= 1, got {args.post_refine_channels}")
+    if args.pre_adapter_target_size <= 0:
+        raise ValueError(f"--pre_adapter_target_size must be > 0, got {args.pre_adapter_target_size}")
+    if args.pre_adapter_target_size % 16 != 0:
+        raise ValueError(
+            f"--pre_adapter_target_size must be divisible by 16 for ViT patching, got {args.pre_adapter_target_size}"
         )
-    print("\nControlled A/B reference notes:")
-    for note in CONTROLLED_AB_NOTES:
-        print(f"  - {note}")
-    sys.exit(0)
+    if args.pre_adapter_hidden_channels < 1:
+        raise ValueError(f"--pre_adapter_hidden_channels must be >= 1, got {args.pre_adapter_hidden_channels}")
+    if args.pre_adapter_depth < 1:
+        raise ValueError(f"--pre_adapter_depth must be >= 1, got {args.pre_adapter_depth}")
+    if args.pre_adapter_norm not in {"in", "bn"}:
+        raise ValueError(f"--pre_adapter_norm must be one of ['in','bn'], got {args.pre_adapter_norm}")
+    if args.pre_adapter_mode not in {"rgb_residual", "gray_edge"}:
+        raise ValueError(
+            f"--pre_adapter_mode must be one of ['rgb_residual','gray_edge'], got {args.pre_adapter_mode}"
+        )
+    if args.pre_adapter_residual_scale_init < 0.0:
+        raise ValueError(
+            f"--pre_adapter_residual_scale_init must be >= 0, got {args.pre_adapter_residual_scale_init}"
+        )
+    if args.enable_encoder_adapters and args.adapter_rank <= 0:
+        raise ValueError(f"--adapter_rank must be > 0, got {args.adapter_rank}")
+    if not (0.0 <= args.adapter_dropout < 1.0):
+        raise ValueError(f"--adapter_dropout must be in [0, 1), got {args.adapter_dropout}")
+    if args.adapter_init_scale < 0.0:
+        raise ValueError(f"--adapter_init_scale must be >= 0, got {args.adapter_init_scale}")
+    if args.adapter_placement not in {"pre", "post"}:
+        raise ValueError(f"--adapter_placement must be one of ['pre','post'], got {args.adapter_placement}")
+    if args.decoder_arch == "transunet" and args.multiscale_skip_mode != "token_pyramid":
+        print(
+            "[WARN] decoder_arch=transunet requires token_pyramid skips; overriding --multiscale_skip_mode to token_pyramid.",
+            file=sys.stderr,
+        )
+        args.multiscale_skip_mode = "token_pyramid"
+    if args.decoder_arch == "transunet" and args.transunet_strict and args.skip_attention != "none":
+        print(
+            "[WARN] decoder_arch=transunet + strict mode uses plain skip fusion; overriding --skip_attention to 'none'.",
+            file=sys.stderr,
+        )
+        args.skip_attention = "none"
+    if args.decoder_arch == "transunet" and args.transunet_strict and args.use_shallow_stem_fusion:
+        print(
+            "[WARN] decoder_arch=transunet + strict mode disables shallow stem fusion.",
+            file=sys.stderr,
+        )
+        args.use_shallow_stem_fusion = False
+    if args.decoder_arch == "transunet" and args.transunet_strict and args.use_post_refine:
+        print(
+            "[WARN] decoder_arch=transunet + strict mode disables post-refine head.",
+            file=sys.stderr,
+        )
+        args.use_post_refine = False
+    if args.decoder_arch == "transunet" and args.transunet_strict and args.deep_supervision:
+        print(
+            "[WARN] decoder_arch=transunet + strict mode disables deep supervision.",
+            file=sys.stderr,
+        )
+        args.deep_supervision = False
+    if args.decoder_arch == "transunet" and not args.transunet_strict:
+        print(
+            "[INFO] decoder_arch=transunet with --no_transunet_strict: keeping user-configured skip_attention / shallow-stem / post-refine / deep-supervision.",
+            file=sys.stderr,
+        )
+    if args.decoder_arch == "fundu" and args.multiscale_skip_mode != "token_pyramid":
+        print(
+            "[WARN] decoder_arch=fundu requires token_pyramid skips; overriding --multiscale_skip_mode to token_pyramid.",
+            file=sys.stderr,
+        )
+        args.multiscale_skip_mode = "token_pyramid"
+    if args.decoder_arch == "fundu" and args.skip_attention != "cbam":
+        print(
+            "[WARN] decoder_arch=fundu uses CBAM skip attention by design; overriding --skip_attention to 'cbam'.",
+            file=sys.stderr,
+        )
+        args.skip_attention = "cbam"
+    if args.decoder_arch == "fundu" and args.use_post_refine:
+        print(
+            "[WARN] decoder_arch=fundu already uses progressive post-adapter; disabling --use_post_refine.",
+            file=sys.stderr,
+        )
+        args.use_post_refine = False
+    if args.decoder_arch == "fundu" and args.deep_supervision:
+        print(
+            "[WARN] decoder_arch=fundu disables deep supervision in current implementation.",
+            file=sys.stderr,
+        )
+        args.deep_supervision = False
+    if args.decoder_arch == "fundu" and args.use_shallow_stem_fusion:
+        print(
+            "[WARN] decoder_arch=fundu disables shallow stem fusion to preserve Fundu-style decoder pathway.",
+            file=sys.stderr,
+        )
+        args.use_shallow_stem_fusion = False
+    if args.decoder_arch == "fundu" and args.fundu_decoder_layers < 1:
+        raise ValueError(f"--fundu_decoder_layers must be >= 1, got {args.fundu_decoder_layers}")
+    if not (0.0 <= args.oct_brightness_jitter <= 1.0):
+        raise ValueError(f"--oct_brightness_jitter must be in [0,1], got {args.oct_brightness_jitter}")
+    if not (0.0 <= args.oct_contrast_jitter <= 1.0):
+        raise ValueError(f"--oct_contrast_jitter must be in [0,1], got {args.oct_contrast_jitter}")
+    if not (0.0 < args.oct_gamma_min <= args.oct_gamma_max):
+        raise ValueError(
+            f"--oct_gamma_min/--oct_gamma_max invalid: min={args.oct_gamma_min}, max={args.oct_gamma_max}"
+        )
+    if not (0.0 <= args.oct_speckle_prob <= 1.0):
+        raise ValueError(f"--oct_speckle_prob must be in [0,1], got {args.oct_speckle_prob}")
+    if not (0.0 <= args.oct_noise_prob <= 1.0):
+        raise ValueError(f"--oct_noise_prob must be in [0,1], got {args.oct_noise_prob}")
+    if not (0.0 <= args.oct_blur_prob <= 1.0):
+        raise ValueError(f"--oct_blur_prob must be in [0,1], got {args.oct_blur_prob}")
+    if not (0.0 <= args.oct_speckle_std_min <= args.oct_speckle_std_max):
+        raise ValueError(
+            f"--oct_speckle_std_min/max invalid: min={args.oct_speckle_std_min}, max={args.oct_speckle_std_max}"
+        )
+    if not (0.0 <= args.oct_noise_std_min <= args.oct_noise_std_max):
+        raise ValueError(
+            f"--oct_noise_std_min/max invalid: min={args.oct_noise_std_min}, max={args.oct_noise_std_max}"
+        )
+    if args.oct_blur_sigma_max < 0.0:
+        raise ValueError(f"--oct_blur_sigma_max must be >= 0, got {args.oct_blur_sigma_max}")
+    if args.use_pre_adapter and args.pre_adapter_residual_scale_init > 0.3:
+        print(
+            f"[WARN] pre-adapter residual init is high ({args.pre_adapter_residual_scale_init}). "
+            "For OCT boundary preservation, 0.05-0.15 is typically safer.",
+            file=sys.stderr,
+        )
+    if args.use_pre_adapter and args.pre_adapter_norm == "in" and args.normalize_imagenet:
+        print(
+            "[WARN] Both input normalization and pre-adapter InstanceNorm are enabled; "
+            "this can over-normalize OCT intensity statistics.",
+            file=sys.stderr,
+        )
 
-if bool(args.val_image_dir) ^ bool(args.val_mask_dir):
-    raise ValueError("--val_image_dir and --val_mask_dir must be provided together")
+    if args.list_ablation_presets:
+        print("Available ablation presets:")
+        for preset_name, preset_flags in ABLATION_PRESETS.items():
+            print(
+                f"  - {preset_name}: "
+                f"attention={preset_flags['use_attention']}, "
+                f"fusion={preset_flags['use_fusion']}, "
+                f"upconvs={preset_flags['use_upconvs']}"
+            )
+        print("\nControlled A/B reference notes:")
+        for note in CONTROLLED_AB_NOTES:
+            print(f"  - {note}")
+        sys.exit(0)
 
-PROGRESSIVE_UNFREEZE_PLAN = parse_unfreeze_schedule(args.progressive_unfreeze_schedule)
+    if bool(args.val_image_dir) ^ bool(args.val_mask_dir):
+        raise ValueError("--val_image_dir and --val_mask_dir must be provided together")
+    if not 0.0 < args.threshold < 1.0:
+        raise ValueError("--threshold must be in (0, 1).")
+    if not np.isfinite(args.thickness_loss_weight) or args.thickness_loss_weight < 0:
+        raise ValueError("--thickness_loss_weight must be finite and nonnegative.")
+    if args.pixel_size_micrometers is not None and (
+        not np.isfinite(args.pixel_size_micrometers) or args.pixel_size_micrometers <= 0
+    ):
+        raise ValueError("--pixel_size_micrometers must be finite and positive.")
+    if args.test_only and args.segment_dir:
+        raise ValueError("Choose either --test_only or --segment_dir.")
+    if args.test_only and not (args.test_image_dir and args.test_mask_dir):
+        raise ValueError("--test_only requires --test_image_dir and --test_mask_dir.")
+    if not (args.test_only or args.segment_dir) and not (args.image_dir and args.mask_dir):
+        raise ValueError("Training requires --image_dir and --mask_dir.")
+    if (args.test_only or args.segment_dir) and args.weights_type != "rfa-unet":
+        raise ValueError("Inference requires a trained checkpoint. Use --weights_type rfa-unet.")
+    if args.measurements_csv and not args.segment_dir:
+        raise ValueError("--measurements_csv requires --segment_dir.")
+    if args.num_epochs < 1:
+        raise ValueError("--num_epochs must be positive.")
 
-# Configuration based on command-line arguments
-ablation_flags = resolve_ablation_flags(args.ablation_preset)
-config = {
-    "image_size": args.image_size,
-    "hidden_dim": 1024,
-    "patch_size": 16,
-    "num_channels": 1 if args.image_mode == "gray" else 3,
-    "num_classes": 2,
-    "retfound_weights_path": args.weights_path,
-    "ablation_preset": args.ablation_preset,
-    "use_attention": ablation_flags["use_attention"],
-    "use_fusion": ablation_flags["use_fusion"],
-    "use_upconvs": ablation_flags["use_upconvs"],
-    "multiscale_skip_mode": args.multiscale_skip_mode,
-    "decoder_arch": args.decoder_arch,
-    "fundu_decoder_layers": args.fundu_decoder_layers,
-    "transunet_hybrid_skips": args.transunet_hybrid_skips,
-    "transunet_r50_pretrained": args.transunet_r50_pretrained,
-    "transunet_freeze_r50": args.transunet_freeze_r50,
-    "skip_standardize_channels": args.skip_standardize_channels,
-    "skip_attention": args.skip_attention,
-    "skip_attention_reduction": args.skip_attention_reduction,
-    "force_bilinear_decoder": args.force_bilinear_decoder,
-    "use_shallow_stem_fusion": args.use_shallow_stem_fusion,
-    "deep_supervision": args.deep_supervision,
-    "use_post_refine": args.use_post_refine,
-    "post_refine_depth": args.post_refine_depth,
-    "post_refine_channels": args.post_refine_channels,
-    "progressive_unfreeze_schedule": args.progressive_unfreeze_schedule,
-    "edge_loss_weight": args.edge_loss_weight,
-    "use_pre_adapter": args.use_pre_adapter,
-    "pre_adapter_target_size": args.pre_adapter_target_size,
-    "pre_adapter_hidden_channels": args.pre_adapter_hidden_channels,
-    "pre_adapter_depth": args.pre_adapter_depth,
-    "pre_adapter_norm": args.pre_adapter_norm,
-    "pre_adapter_mode": args.pre_adapter_mode,
-    "pre_adapter_residual_scale_init": args.pre_adapter_residual_scale_init,
-    "pre_adapter_rgb_scalars": args.pre_adapter_rgb_scalars,
-    "enable_encoder_adapters": args.enable_encoder_adapters,
-    "adapter_rank": args.adapter_rank,
-    "adapter_blocks": args.adapter_blocks,
-    "adapter_dropout": args.adapter_dropout,
-    "adapter_init_scale": args.adapter_init_scale,
-    "adapter_placement": args.adapter_placement,
-}
+
+def model_config(args):
+    ablation_flags = resolve_ablation_flags(args.ablation_preset)
+    return {
+        "image_size": args.image_size,
+        "normalize_imagenet": args.normalize_imagenet,
+        "hidden_dim": 1024,
+        "patch_size": 16,
+        "num_channels": 1 if args.image_mode == "gray" else 3,
+        "num_classes": 2,
+        "ablation_preset": args.ablation_preset,
+        "use_attention": ablation_flags["use_attention"],
+        "use_fusion": ablation_flags["use_fusion"],
+        "use_upconvs": ablation_flags["use_upconvs"],
+        "multiscale_skip_mode": args.multiscale_skip_mode,
+        "decoder_arch": args.decoder_arch,
+        "fundu_decoder_layers": args.fundu_decoder_layers,
+        "transunet_hybrid_skips": args.transunet_hybrid_skips,
+        "transunet_r50_pretrained": args.transunet_r50_pretrained,
+        "transunet_freeze_r50": args.transunet_freeze_r50,
+        "skip_standardize_channels": args.skip_standardize_channels,
+        "skip_attention": args.skip_attention,
+        "skip_attention_reduction": args.skip_attention_reduction,
+        "force_bilinear_decoder": args.force_bilinear_decoder,
+        "use_shallow_stem_fusion": args.use_shallow_stem_fusion,
+        "deep_supervision": args.deep_supervision,
+        "use_post_refine": args.use_post_refine,
+        "post_refine_depth": args.post_refine_depth,
+        "post_refine_channels": args.post_refine_channels,
+        "progressive_unfreeze_schedule": args.progressive_unfreeze_schedule,
+        "edge_loss_weight": args.edge_loss_weight,
+        "use_pre_adapter": args.use_pre_adapter,
+        "pre_adapter_target_size": args.pre_adapter_target_size,
+        "pre_adapter_hidden_channels": args.pre_adapter_hidden_channels,
+        "pre_adapter_depth": args.pre_adapter_depth,
+        "pre_adapter_norm": args.pre_adapter_norm,
+        "pre_adapter_mode": args.pre_adapter_mode,
+        "pre_adapter_residual_scale_init": args.pre_adapter_residual_scale_init,
+        "pre_adapter_rgb_scalars": args.pre_adapter_rgb_scalars,
+        "enable_encoder_adapters": args.enable_encoder_adapters,
+        "adapter_rank": args.adapter_rank,
+        "adapter_blocks": args.adapter_blocks,
+        "adapter_dropout": args.adapter_dropout,
+        "adapter_init_scale": args.adapter_init_scale,
+        "adapter_placement": args.adapter_placement,
+    }
+
 
 # Weights file paths
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
@@ -677,46 +711,86 @@ RFA_UNET_WEIGHTS_PATH  = "weights/best_rfa_unet.pth"
 
 RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1zDEdAmNwNK8I-QEa6fqL5E3WjDn7Z-__"
 
-# Function to download RFA-U-Net weights (unchanged)
-def download_weights(weights_path, url):
-    if not os.path.exists(weights_path):
-        print(f"Weights file not found at {weights_path}. Downloading...")
-        if gdown is None:
-            raise ImportError("gdown is required to download RFA-U-Net weights from Google Drive. Install it with `pip install gdown`.")
-        os.makedirs(os.path.dirname(weights_path), exist_ok=True)
-        gdown.download(url, weights_path, quiet=False)
-        print(f"Weights downloaded to {weights_path}")
-    else:
-        print(f"Weights file already exists at {weights_path}")
-
-# Determine which weights to load based on weights_type
-if args.weights_type == 'retfound':
-    print("Using RETFound weights for training from scratch")
-    # ensure the folder exists
-    os.makedirs(os.path.dirname(RETFOUND_WEIGHTS_PATH), exist_ok=True)
-
-    if os.path.exists(RETFOUND_WEIGHTS_PATH):
-        config["retfound_weights_path"] = RETFOUND_WEIGHTS_PATH
-    else:
-        config["retfound_weights_path"] = download_retfound_weights_hf(
+def resolve_weights(args):
+    if args.weights_type == "none":
+        return None
+    if args.weights_path:
+        if not os.path.isfile(args.weights_path):
+            raise FileNotFoundError(args.weights_path)
+        return args.weights_path
+    if args.weights_type == "retfound":
+        if os.path.isfile(RETFOUND_WEIGHTS_PATH):
+            return RETFOUND_WEIGHTS_PATH
+        return download_retfound_weights_hf(
             repo_id="YukunZhou/RETFound_mae_natureOCT",
             filename="RETFound_mae_natureOCT.pth",
-            cache_dir="weights"
         )
-    print(f"→ RETFound weights at {config['retfound_weights_path']}")
-    
-elif args.weights_type == 'rfa-unet':
-    if os.path.exists(args.weights_path):
-        config["retfound_weights_path"] = args.weights_path
-        print(f"Using pre-trained RFA-U-Net weights from user-provided path: {args.weights_path}")
-    else:
-        # fallback to Google-Drive download
-        config["retfound_weights_path"] = RFA_UNET_WEIGHTS_PATH
-        download_weights(RFA_UNET_WEIGHTS_PATH, RFA_UNET_WEIGHTS_URL)
-        print("Using pre-trained RFA-U-Net weights for inference or fine-tuning")
+    if not os.path.isfile(RFA_UNET_WEIGHTS_PATH):
+        if gdown is None:
+            raise ImportError("Install gdown to download the released RFA-U-Net checkpoint.")
+        os.makedirs(os.path.dirname(RFA_UNET_WEIGHTS_PATH), exist_ok=True)
+        if not gdown.download(RFA_UNET_WEIGHTS_URL, RFA_UNET_WEIGHTS_PATH):
+            raise RuntimeError("Checkpoint download failed. Use --weights_path with a local checkpoint.")
+    return RFA_UNET_WEIGHTS_PATH
 
-elif args.weights_type == 'none':
-    print("No pre-trained weights specified. Initializing model with random weights.")
+
+def load_checkpoint(path):
+    # Historical checkpoints store a NumPy float64 validation score alongside tensors.
+    numpy_core = np._core if hasattr(np, "_core") else np.core
+    scalar = numpy_core.multiarray.scalar
+    safe_globals = [
+        scalar, (scalar, "numpy.core.multiarray.scalar"),
+        np.dtype, type(np.dtype("float64")),
+    ]
+    with torch.serialization.safe_globals(safe_globals):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=True, mmap=zipfile.is_zipfile(path))
+        except pickle.UnpicklingError as exc:
+            raise ValueError(f"Cannot safely load checkpoint {path}: {exc}") from exc
+
+
+def checkpoint_model(args, device):
+    config = model_config(args)
+    weights = resolve_weights(args)
+    if weights is None:
+        return AttentionUNetViT(config).to(device), config
+    checkpoint = load_checkpoint(weights)
+    state = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
+    if args.weights_type == "retfound":
+        model = AttentionUNetViT(config)
+        state = adapt_patch_embed_in_channels(state, config["num_channels"])
+        interpolate_pos_embed(model.encoder, state)
+        result = load_state_dict_flexible(model.encoder, state)
+        required = [k for k in result.missing_keys
+                    if k.startswith(("blocks.", "patch_embed.")) or k in {"cls_token", "pos_embed"}]
+        if required:
+            raise ValueError(f"Incomplete RETFound backbone: {', '.join(required[:8])}")
+    else:
+        saved_config = checkpoint.get("model_config")
+        if saved_config:
+            config = dict(saved_config)
+        elif "d4.c1.conv.0.weight" in state:
+            # The released checkpoint predates the ablation decoder and used patch tokens only.
+            config.update(
+                released_layout=True, image_size=224, num_channels=3, normalize_imagenet=True,
+                ablation_preset="attention_fusion", decoder_arch="rfa", multiscale_skip_mode="legacy",
+                use_attention=True, use_fusion=True, use_upconvs=False, use_pre_adapter=False,
+                use_shallow_stem_fusion=False, use_post_refine=False, deep_supervision=False,
+                enable_encoder_adapters=False,
+            )
+            state = {k.replace(".c1.", ".c_fusion.", 1) if k.startswith(("d1.", "d2.", "d3.", "d4."))
+                     else k: v for k, v in state.items()}
+        model = AttentionUNetViT({**config, "transunet_r50_pretrained": False})
+        try:
+            model.load_state_dict(state, strict=True)
+        except RuntimeError as exc:
+            raise ValueError(
+                "The RFA-U-Net checkpoint does not match the model. For a checkpoint saved "
+                "without configuration, pass the same architecture and preprocessing flags used in training."
+            ) from exc
+    print(f"Loaded {args.weights_type} weights from {weights}.")
+    return model.to(device), config
+
 
 # Convolutional block for decoder
 class ConvBlock(nn.Module):
@@ -820,11 +894,12 @@ class AttentionGate(nn.Module):
 
 # Decoder block with ablation toggles
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, use_attention=True, use_fusion=True, use_upconvs=True, reduce_skip=True):
+    def __init__(self, in_c, out_c, use_attention=True, use_fusion=True, use_upconvs=True, reduce_skip=True, released_layout=False):
         super().__init__()
         self.use_attention = use_attention
         self.use_fusion = use_fusion
         self.use_upconvs = use_upconvs
+        self.released_layout = released_layout
 
         if self.use_upconvs:
             self.up = nn.ConvTranspose2d(in_c[0], out_c, kernel_size=2, stride=2)
@@ -836,7 +911,7 @@ class DecoderBlock(nn.Module):
         self.reduce_channels_s = nn.Conv2d(in_c[1], out_c, kernel_size=1) if reduce_skip else nn.Identity()
         self.ag = AttentionGate([out_c, out_c], out_c) if self.use_attention else nn.Identity()
         self.c_fusion = ConvBlock(out_c + out_c, out_c)
-        self.c_plain = ConvBlock(out_c, out_c)
+        self.c_plain = None if released_layout else ConvBlock(out_c, out_c)
 
     def forward(self, x, s):
         x = self.up(x)
@@ -847,7 +922,7 @@ class DecoderBlock(nn.Module):
 
         s = self.reduce_channels_s(s)
 
-        if x.shape[-2:] != s.shape[-2:]:
+        if not self.released_layout and x.shape[-2:] != s.shape[-2:]:
             s = F.interpolate(s, size=x.shape[-2:], mode='bilinear', align_corners=True)
 
         if self.use_attention:
@@ -1272,6 +1347,7 @@ class AttentionUNetViT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.configured_image_size = int(config.get("image_size", 224))
+        self.released_layout = config.get("released_layout", False)
         self.input_channels = int(config.get("num_channels", 3))
         if self.configured_image_size <= 0:
             raise ValueError(f"image_size must be > 0, got {self.configured_image_size}")
@@ -1325,61 +1401,6 @@ class AttentionUNetViT(nn.Module):
         else:
             self.pre_adapter = None
             encoder_input_size = self.configured_image_size
-        # Ensure patch embedding matches selected input channel count.
-        self.encoder.patch_embed.proj = nn.Conv2d(self.input_channels, 1024, kernel_size=(16, 16), stride=(16, 16))
-        # Load weights if specified
-        if args.weights_type in ['retfound', 'rfa-unet']:
-            # ensure file exists
-            if not os.path.exists(config["retfound_weights_path"]):
-                raise FileNotFoundError(
-                    f"{args.weights_type}-weights file not found: "
-                    f"{config['retfound_weights_path']}. Please download it and place it under `weights/`."
-                )
-
-            # 1) load full checkpoint (may include optimizer, epoch, etc.)
-            raw_ckpt = torch.load(
-                config["retfound_weights_path"],
-                map_location='cpu',
-                weights_only=False
-            )
-            print("Checkpoint keys:", list(raw_ckpt.keys()))
-
-            # 2) extract just the model state dict (under model_state_dict or model)
-            state_dict = raw_ckpt.get(
-                'model_state_dict',
-                raw_ckpt.get('model', raw_ckpt)
-            )
-            
-
-            # 3) sanity‐check only the tensor values
-            for k, v in state_dict.items():
-                if torch.is_tensor(v):
-                    if torch.isnan(v).any() or torch.isinf(v).any():
-                        raise ValueError(f"Checkpoint tensor '{k}' contains NaN or Inf")
-
-            # 4) move tensors to GPU if available
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            state_dict = {k: v.to(device) if torch.is_tensor(v) else v for k, v in state_dict.items()}
-
-
-            if args.weights_type == 'retfound':
-                state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=self.input_channels)
-                # remove incompatible keys, interpolate positional embeddings
-                own = self.encoder.state_dict()
-                for k in ['patch_embed.proj.weight', 'patch_embed.proj.bias', 'head.weight', 'head.bias']:
-                    if k in state_dict and state_dict[k].shape != own[k].shape:
-                        print(f"Removing key {k} from pretrained checkpoint")
-                        del state_dict[k]
-                interpolate_pos_embed(self.encoder, state_dict)
-                msg = load_state_dict_flexible(self.encoder, state_dict)
-                print("Loaded RETFound weights, missing keys:", msg.missing_keys)
-                trunc_normal_(self.encoder.head.weight, std=2e-5)
-            else:
-                # pure RFA-U-Net checkpoint
-                state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=self.input_channels)
-                msg = load_state_dict_flexible(self, state_dict)
-                print("Loaded RFA-U-Net weights, missing keys:", msg.missing_keys)
-
         # Allow training/inference at runtime sizes by resizing positional embeddings in forward().
         # If pre-adapter is enabled, ViT itself operates at pre_adapter_target_size.
         if hasattr(self.encoder, "patch_embed") and hasattr(self.encoder.patch_embed, "img_size"):
@@ -1551,10 +1572,10 @@ class AttentionUNetViT(nn.Module):
                     f"force_bilinear={self.force_bilinear_decoder}"
                 )
         else:
-            self.d1 = DecoderBlock([1024, 1024], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-            self.d2 = DecoderBlock([512, 1024], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-            self.d3 = DecoderBlock([256, 1024], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
-            self.d4 = DecoderBlock([128, 1024], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs)
+            self.d1 = DecoderBlock([1024, 1024], 512, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs, released_layout=self.released_layout)
+            self.d2 = DecoderBlock([512, 1024], 256, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs, released_layout=self.released_layout)
+            self.d3 = DecoderBlock([256, 1024], 128, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs, released_layout=self.released_layout)
+            self.d4 = DecoderBlock([128, 1024], 64, use_attention=use_attention, use_fusion=use_fusion, use_upconvs=use_upconvs, released_layout=self.released_layout)
             self.d2_out_channels = 256
             self.d3_out_channels = 128
             self.decoder_out_channels = 64
@@ -1651,9 +1672,13 @@ class AttentionUNetViT(nn.Module):
         x_for_hybrid_skips = x
         batch_size = x.shape[0]
         x = self.encoder.patch_embed(x)  # [B, N, C]
-        cls_token = self.encoder.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat((cls_token, x), dim=1)  # [B, 1+N, C]
-        pos_embed = self._resize_pos_embed(self.encoder.pos_embed, x.shape[1]).to(x.device)
+        pos_embed = self.encoder.pos_embed
+        if self.released_layout:
+            pos_embed = self._resize_pos_embed(pos_embed, x.shape[1] + 1)[:, 1:]
+        else:
+            cls_token = self.encoder.cls_token.expand(batch_size, -1, -1)
+            x = torch.cat((cls_token, x), dim=1)
+            pos_embed = self._resize_pos_embed(pos_embed, x.shape[1])
         x = x + pos_embed
         x = self.encoder.pos_drop(x)
         skip_connections = []
@@ -1665,7 +1690,7 @@ class AttentionUNetViT(nn.Module):
             if self.enable_encoder_adapters and self.adapter_placement == "post" and key in self.encoder_adapters:
                 x = self.encoder_adapters[key](x)
             if i in [5, 11, 17, 23]:
-                skip_connections.append(x[:, 1:, :])  # drop cls token
+                skip_connections.append(x if self.released_layout else x[:, 1:])
         z6_tokens, z12_tokens, z18_tokens, z24_tokens = skip_connections
         z6 = self._tokens_to_feature_map(z6_tokens)
         z12 = self._tokens_to_feature_map(z12_tokens)
@@ -1713,7 +1738,7 @@ class AttentionUNetViT(nn.Module):
                 s_d3 = F.interpolate(s_d3, size=d3.shape[-2:], mode='bilinear', align_corners=True)
             d3 = d3 + s_d3
         # Final upsampling stage as pure refinement (avoid reusing z6 twice).
-        d4 = self.d4(d3, None)
+        d4 = self.d4(d3, z6 if self.released_layout else None)
         if self.use_shallow_stem_fusion:
             s_d4 = self.shallow_to_d4(stem)  # [B,64,224,224]
             if s_d4.shape[-2:] != d4.shape[-2:]:
@@ -1739,7 +1764,7 @@ class AttentionUNetViT(nn.Module):
 
 # Tversky Loss (Aligned with root code)
 class TverskyLoss(nn.Module):
-    def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6, class_weights=(1.0, 2.0), mode='both', choroid_class_idx=1):
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1e-6, class_weights=(1.0, 2.0), mode='both', choroid_class_idx=1, released_layout=False):
         super().__init__()
         self.alpha = alpha
         self.beta  = beta
@@ -1747,10 +1772,12 @@ class TverskyLoss(nn.Module):
         self.class_weights = class_weights
         self.mode = mode
         self.choroid_class_idx = int(choroid_class_idx)
+        self.released_layout = released_layout
 
     def forward(self, outputs, targets):
         # outputs: (B,2,H,W), targets: one-hot (B,2,H,W)
-        probs = torch.softmax(outputs, dim=1)
+        outputs = outputs.float()
+        probs = outputs.sigmoid() if self.released_layout else outputs.softmax(dim=1)
 
         if self.mode == 'choroid_only':
             c = self.choroid_class_idx
@@ -1791,24 +1818,6 @@ class DiceLoss(nn.Module):
         dice = (2. * intersection + self.smooth) / (outputs.sum() + targets.sum() + self.smooth)
         return 1 - dice
 
-# Dice Score (Updated to compute both combined and choroid-specific Dice scores)
-def dice_score(outputs, targets, smooth=1e-6):
-    probs = torch.softmax(outputs, dim=1)
-    # Compute combined Dice score (across both classes, matching root code)
-    outputs_combined = probs.contiguous().view(-1)
-    targets_combined = targets.contiguous().view(-1)
-    intersection_combined = (outputs_combined * targets_combined).sum()
-    dice_combined = (2. * intersection_combined + smooth) / (outputs_combined.sum() + targets_combined.sum() + smooth)
-
-    # Compute choroid-specific Dice score (channel 1)
-    outputs_choroid = probs[:, 1, :, :].contiguous().view(-1)
-    targets_choroid = targets[:, 1, :, :].contiguous().view(-1)
-    intersection_choroid = (outputs_choroid * targets_choroid).sum()
-    dice_choroid = (2. * intersection_choroid + smooth) / (outputs_choroid.sum() + targets_choroid.sum() + smooth)
-
-    return dice_combined.item(), dice_choroid.item()
-
-
 def get_main_logits(model_outputs):
     if isinstance(model_outputs, dict):
         if "main" not in model_outputs:
@@ -1817,12 +1826,12 @@ def get_main_logits(model_outputs):
     return model_outputs
 
 
-def edge_dice_loss_choroid(logits, targets, choroid_idx=1, eps=1e-6):
+def edge_dice_loss_choroid(probability, targets, eps=1e-6):
     """
     Edge-aware Dice loss on choroid boundaries using Sobel magnitude maps.
     """
-    probs = torch.softmax(logits, dim=1)[:, choroid_idx:choroid_idx + 1, :, :]
-    tgt = targets[:, choroid_idx:choroid_idx + 1, :, :].float()
+    probs = probability.unsqueeze(1)
+    tgt = targets[:, 1:2].float()
     if probs.shape[-2:] != tgt.shape[-2:]:
         tgt = F.interpolate(tgt, size=probs.shape[-2:], mode='nearest')
 
@@ -1841,13 +1850,13 @@ def edge_dice_loss_choroid(logits, targets, choroid_idx=1, eps=1e-6):
     pgy = F.conv2d(probs, ky, padding=1)
     tgx = F.conv2d(tgt, kx, padding=1)
     tgy = F.conv2d(tgt, ky, padding=1)
-    p_edge = torch.sqrt(pgx * pgx + pgy * pgy + eps)
-    t_edge = torch.sqrt(tgx * tgx + tgy * tgy + eps)
+    p_edge = torch.sqrt(pgx.float().square() + pgy.float().square() + eps)
+    t_edge = torch.sqrt(tgx.float().square() + tgy.float().square() + eps)
 
     p_edge = p_edge.reshape(p_edge.shape[0], -1)
     t_edge = t_edge.reshape(t_edge.shape[0], -1)
     inter = (p_edge * t_edge).sum(dim=1)
-    den = p_edge.sum(dim=1) + t_edge.sum(dim=1)
+    den = p_edge.square().sum(dim=1) + t_edge.square().sum(dim=1)
     dice = (2.0 * inter + eps) / (den + eps)
     return 1.0 - dice.mean()
 
@@ -1859,12 +1868,16 @@ def compute_total_loss(
     aux_weight_d2=0.2,
     aux_weight_d3=0.1,
     edge_loss_weight=0.0,
+    thickness_loss_weight=0.0,
 ):
     logits = get_main_logits(model_outputs)
     loss = criterion(logits, targets)
-    edge_w = float(edge_loss_weight)
-    if edge_w > 0.0:
-        loss = loss + edge_w * edge_dice_loss_choroid(logits, targets, choroid_idx=1)
+    if edge_loss_weight > 0.0 or thickness_loss_weight > 0.0:
+        probability = choroid_probability(logits, criterion.released_layout)
+        if edge_loss_weight > 0.0:
+            loss = loss + edge_loss_weight * edge_dice_loss_choroid(probability, targets)
+        if thickness_loss_weight > 0.0:
+            loss = loss + thickness_loss_weight * thickness_loss_choroid(probability, targets)
     if isinstance(model_outputs, dict):
         if "aux_d2" in model_outputs:
             loss = loss + float(aux_weight_d2) * criterion(model_outputs["aux_d2"], targets)
@@ -1872,95 +1885,6 @@ def compute_total_loss(
             loss = loss + float(aux_weight_d3) * criterion(model_outputs["aux_d3"], targets)
     return loss
 
-# Boundary Detection and Error Computation
-def compute_errors(pred_boundaries, gt_boundaries, pixel_size):
-    signed_errors = []
-    unsigned_errors = []
-    for pred, gt in zip(pred_boundaries, gt_boundaries):
-        if pred is None or gt is None:
-            continue
-        signed_error = (pred - gt) * pixel_size
-        unsigned_error = abs(signed_error)
-        signed_errors.append(signed_error)
-        unsigned_errors.append(unsigned_error)
-    if not signed_errors:  # If no valid boundary pairs, return 0.0
-        print("Warning: No valid boundary pairs found for error computation. Returning 0.0.")
-        return 0.0, 0.0
-    return np.mean(signed_errors), np.mean(unsigned_errors)
-
-# Visualization Function
-def plot_boundaries(images, true_masks, predicted_masks, threshold):
-    """
-    Plots the original image, true mask, predicted mask, and boundaries.
-    Also computes and displays the mean signed and unsigned errors in micrometers.
-
-    Parameters:
-    images (torch.Tensor): Batch of original images.
-    true_masks (torch.Tensor): Batch of true masks.
-    predicted_masks (torch.Tensor): Batch of predicted masks.
-    threshold (float): Threshold for binarizing predicted masks.
-    """
-    batch_size = images.size(0)
-
-    for i in range(batch_size):
-        image = images[i].cpu().numpy().transpose(1, 2, 0)
-        if image.shape[-1] == 1:
-            # Grayscale pipeline: expand to pseudo-RGB so boundary colors can be drawn.
-            image = np.repeat(image, 3, axis=2)
-        true_mask = true_masks[i, 1].cpu().numpy()  # True choroid mask
-        predicted_mask = predicted_masks[i, 1].cpu().numpy()  # Predicted choroid mask
-
-        predicted_mask_binary = (predicted_mask > threshold).astype(np.uint8)  # FIXED: use parameter
-        # we know true_mask is already 0/1, so just test for ==1
-        true_mask_binary = (true_mask == 1).astype(np.uint8)
-
-        # Get boundaries
-        pred_upper, pred_lower = find_boundaries(predicted_mask_binary)
-        gt_upper, gt_lower = find_boundaries(true_mask_binary)
-
-        # Compute errors in micrometers
-        upper_signed_error, upper_unsigned_error = compute_errors(pred_upper, gt_upper, args.pixel_size_micrometers)
-        lower_signed_error, lower_unsigned_error = compute_errors(pred_lower, gt_lower, args.pixel_size_micrometers)
-
-        # Print errors
-        print(f"Image {i + 1}:")
-        print(f"Upper Boundary Signed Error: {upper_signed_error:.2f} μm")
-        print(f"Upper Boundary Unsigned Error: {upper_unsigned_error:.2f} μm")
-        print(f"Lower Boundary Signed Error: {lower_signed_error:.2f} μm")
-        print(f"Lower Boundary Unsigned Error: {lower_unsigned_error:.2f} μm")
-
-        # Create boundary visualization
-        combined_image = image.copy()
-        for col in range(len(pred_upper)):
-            if gt_upper[col] is not None:
-                combined_image[gt_upper[col], col] = [1, 0, 0]  # Red for true upper boundary
-            if gt_lower[col] is not None:
-                combined_image[gt_lower[col], col] = [0, 1, 0]  # Green for true lower boundary
-            if pred_upper[col] is not None:
-                combined_image[pred_upper[col], col] = [0, 0, 1]  # Blue for predicted upper boundary
-            if pred_lower[col] is not None:
-                combined_image[pred_lower[col], col] = [1, 1, 0]  # Yellow for predicted lower boundary
-
-        # Plotting
-        plt.figure(figsize=(16, 8))
-        plt.subplot(1, 4, 1)
-        plt.imshow(image)
-        plt.title('Original Image')
-        plt.axis('off')
-        plt.subplot(1, 4, 2)
-        plt.imshow(true_mask_binary, cmap='gray')
-        plt.title('True Mask')
-        plt.axis('off')
-        plt.subplot(1, 4, 3)
-        plt.imshow(predicted_mask_binary, cmap='gray')
-        plt.title('Predicted Mask')
-        plt.axis('off')
-        plt.subplot(1, 4, 4)
-        plt.imshow(combined_image)
-        plt.title('Boundaries\n(True Upper: Red, True Lower: Green, Pred Upper: Blue, Pred Lower: Yellow)')
-        plt.axis('off')
-        plt.show()
-# Data Transforms
 class JointSegmentationTransform:
     """Synchronized image/mask transform for segmentation."""
     def __init__(
@@ -2092,223 +2016,218 @@ class JointSegmentationTransform:
         return image_t, mask_onehot
 
 
-_imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-_img_eval_ops = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor()]
-if args.image_mode == 'gray':
-    _imagenet_norm = transforms.Normalize(mean=[0.5], std=[0.5])
-if args.normalize_imagenet:
-    _img_eval_ops.append(_imagenet_norm)
-image_only_transform = transforms.Compose(_img_eval_ops)
+def make_train_transform(args, config):
+    return JointSegmentationTransform(
+        image_size=config["image_size"],
+        augment=True,
+        normalize=config["normalize_imagenet"],
+        num_classes=2,
+        image_mode="gray" if config["num_channels"] == 1 else "rgb",
+        random_resized_crop=args.augment_random_resized_crop,
+        crop_scale_min=args.augment_scale_min,
+        hflip_prob=args.augment_hflip_prob,
+        rotation_deg=args.augment_rotation_deg,
+        color_jitter=args.augment_color_jitter,
+        oct_intensity_aug=args.oct_intensity_aug,
+        oct_brightness_jitter=args.oct_brightness_jitter,
+        oct_contrast_jitter=args.oct_contrast_jitter,
+        oct_gamma_min=args.oct_gamma_min,
+        oct_gamma_max=args.oct_gamma_max,
+        oct_speckle_prob=args.oct_speckle_prob,
+        oct_speckle_std_min=args.oct_speckle_std_min,
+        oct_speckle_std_max=args.oct_speckle_std_max,
+        oct_noise_prob=args.oct_noise_prob,
+        oct_noise_std_min=args.oct_noise_std_min,
+        oct_noise_std_max=args.oct_noise_std_max,
+        oct_blur_prob=args.oct_blur_prob,
+        oct_blur_sigma_max=args.oct_blur_sigma_max,
+    )
 
-train_transform = JointSegmentationTransform(
-    image_size=args.image_size,
-    augment=True,
-    normalize=args.normalize_imagenet,
-    num_classes=2,
-    image_mode=args.image_mode,
-    random_resized_crop=args.augment_random_resized_crop,
-    crop_scale_min=args.augment_scale_min,
-    hflip_prob=args.augment_hflip_prob,
-    rotation_deg=args.augment_rotation_deg,
-    color_jitter=args.augment_color_jitter,
-    oct_intensity_aug=args.oct_intensity_aug,
-    oct_brightness_jitter=args.oct_brightness_jitter,
-    oct_contrast_jitter=args.oct_contrast_jitter,
-    oct_gamma_min=args.oct_gamma_min,
-    oct_gamma_max=args.oct_gamma_max,
-    oct_speckle_prob=args.oct_speckle_prob,
-    oct_speckle_std_min=args.oct_speckle_std_min,
-    oct_speckle_std_max=args.oct_speckle_std_max,
-    oct_noise_prob=args.oct_noise_prob,
-    oct_noise_std_min=args.oct_noise_std_min,
-    oct_noise_std_max=args.oct_noise_std_max,
-    oct_blur_prob=args.oct_blur_prob,
-    oct_blur_sigma_max=args.oct_blur_sigma_max,
-)
-val_test_transform = JointSegmentationTransform(
-    image_size=args.image_size,
-    augment=False,
-    normalize=args.normalize_imagenet,
-    num_classes=2,
-    image_mode=args.image_mode,
-)
-def save_segmentation_results(filenames, original_sizes, predicted_masks, output_dir, segment_dir, save_overlay=False, threshold=0.5):
-    """
-    Save segmentation results as masks and optionally as overlay images.
-    FIXED: Loads original images directly from disk for overlays instead of using transformed tensors.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    mask_dir = os.path.join(output_dir, 'masks')
-    os.makedirs(mask_dir, exist_ok=True)
-    if save_overlay:
-        overlay_dir = os.path.join(output_dir, 'overlays')
-        os.makedirs(overlay_dir, exist_ok=True)
 
-    for i in range(len(filenames)):
-        filename = filenames[i]
-        base_name = os.path.splitext(filename)[0]
-        original_size = original_sizes[i]  # (width, height)
+def choroid_probability(logits, released_layout):
+    if released_layout:
+        return logits[:, 1].float().sigmoid()
+    return logits.float().softmax(dim=1)[:, 1]
 
-        # Get predicted mask for choroid class (channel 1)
-        pred_mask = predicted_masks[i, 1].cpu().numpy()
-        pred_mask_binary = (pred_mask > threshold).astype(np.uint8) * 255
 
-        # Ensure original_size is in correct format (width, height)
-        if isinstance(original_size, (list, tuple)) and len(original_size) == 2:
-            target_size = (int(original_size[0]), int(original_size[1]))  # (width, height)
+def predict_choroid(model, images, tta_hflip=False):
+    probability = choroid_probability(get_main_logits(model(images)), model.released_layout)
+    if tta_hflip:
+        flipped = get_main_logits(model(images.flip(-1)))
+        probability = (probability + choroid_probability(flipped, model.released_layout).flip(-1)) / 2
+    return probability
+
+
+def create_overlay_image(image, mask):
+    overlay = np.array(image.convert("RGB"))
+    top, bottom, present = column_bounds(mask)
+    columns = np.flatnonzero(present)
+    overlay[bottom[columns], columns] = (0, 255, 0)
+    overlay[top[columns], columns] = (255, 0, 0)
+    return Image.fromarray(overlay)
+
+
+class NativeScans(torch.utils.data.Dataset):
+    def __init__(self, transform, image_mode, dataset=None, directory=None):
+        self.transform = transform
+        self.image_mode = image_mode
+        self.dataset = dataset
+        if isinstance(dataset, Subset):
+            self.paths = [dataset.dataset.image_paths[idx] for idx in dataset.indices]
+        elif dataset is not None:
+            self.paths = dataset.image_paths
         else:
-            print(f"⚠️ Warning: Unexpected original_size format: {original_size}. Using fallback 224x224.")
-            target_size = (224, 224)
+            self.paths = image_paths(directory)
+            index_by_stem(self.paths)
+        if not self.paths:
+            raise ValueError(f"No OCT images found in {directory}.")
 
-        # Resize predicted mask to original image dimensions
-        pred_mask_pil = Image.fromarray(pred_mask_binary.astype(np.uint8))
-        pred_mask_resized = pred_mask_pil.resize(target_size, Image.NEAREST)
-        mask_for_overlay = np.array(pred_mask_resized)
+    def __len__(self):
+        return len(self.paths)
 
-        # Save final binary mask
-        mask_path = os.path.join(mask_dir, f'{base_name}_mask.png')
-        pred_mask_resized.save(mask_path)
-        print(f"💾 Saved segmentation mask: {mask_path}")
-
-        if save_overlay:
-            try:
-                # CRITICAL FIX: Load ORIGINAL image directly from disk
-                img_path = os.path.join(segment_dir, filename)
-                original_image = Image.open(img_path).convert('RGB')
-                
-                # Handle size mismatch between recorded size and actual image
-                if original_image.size != target_size:
-                    print(f"⚠️ Size mismatch for {filename}: recorded {target_size} vs actual {original_image.size}. Resizing image.")
-                    original_image = original_image.resize(target_size, Image.LANCZOS)
-                
-                # Create overlay using ACTUAL original pixels
-                overlay = create_overlay_image(np.array(original_image), mask_for_overlay)
-                overlay_path = os.path.join(overlay_dir, f'{base_name}_overlay.png')
-                overlay.save(overlay_path)
-                print(f"✅ Saved overlay: {overlay_path}")
-                
-            except Exception as e:
-                print(f"❌ Error creating overlay for {filename}: {str(e)}")
-                continue
-
-def create_overlay_image(image_np, mask_np):
-    """
-    Create an overlay image with segmentation boundaries using original pixel data.
-    FIXED: Proper boundary detection and drawing with bounds checking.
-    """
-    # Ensure we're working with clean copies in correct format
-    overlay_image = image_np.copy().astype(np.uint8)
-    binary_mask = (mask_np > 0).astype(np.uint8)  # Ensure binary mask
-    
-    # Find boundaries (column-wise processing)
-    upper_boundaries, lower_boundaries = find_boundaries(binary_mask)
-    
-    # Draw boundaries with bounds checking
-    H, W = overlay_image.shape[:2]
-    for col in range(W):
-        if col >= len(upper_boundaries) or col >= len(lower_boundaries):
-            continue
-            
-        # Upper boundary (red) - check bounds
-        if upper_boundaries[col] is not None:
-            row = int(upper_boundaries[col])
-            if 0 <= row < H and 0 <= col < W:
-                overlay_image[row, col] = [255, 0, 0]  # Red
-        
-        # Lower boundary (green) - check bounds
-        if lower_boundaries[col] is not None:
-            row = int(lower_boundaries[col])
-            if 0 <= row < H and 0 <= col < W:
-                overlay_image[row, col] = [0, 255, 0]  # Green
-    
-    return Image.fromarray(overlay_image)
-
-def find_boundaries(mask):
-    """
-    Find upper and lower boundaries for each column in a binary mask.
-    FIXED: Proper column-wise processing with robust handling of empty columns.
-    """
-    upper_boundaries = []
-    lower_boundaries = []
-    
-    # Process each column (x-coordinate)
-    for col in range(mask.shape[1]):
-        col_data = mask[:, col]
-        non_zero_indices = np.where(col_data > 0)[0]
-        
-        if len(non_zero_indices) > 0:
-            upper_boundaries.append(non_zero_indices[0])    # First non-zero from top
-            lower_boundaries.append(non_zero_indices[-1])   # Last non-zero from top
+    def __getitem__(self, index):
+        path = self.paths[index]
+        if isinstance(self.dataset, Subset):
+            image, reference = self.dataset.dataset.load_pair(self.dataset.indices[index])
+        elif self.dataset is not None:
+            image, reference = self.dataset.load_pair(index)
         else:
-            upper_boundaries.append(None)
-            lower_boundaries.append(None)
-            
-    return upper_boundaries, lower_boundaries
+            image, reference = load_scan(path, self.image_mode), None
+        return self.transform(image), path, image.size, reference
 
-# Training and Evaluation Functions
-def train_fold(
-    train_loader,
-    valid_loader,
-    test_loader,
-    model,
-    criterion,
-    optimizer,
-    device,
-    num_epochs,
-    scaler,
-    threshold,
-    save_best_path,
-    scheduler=None,
-    early_stopping_patience=0,
-    early_stopping_min_delta=0.0,
-    aux_weight_d2=0.2,
-    aux_weight_d3=0.1,
-    edge_loss_weight=0.0,
-    progressive_unfreeze_schedule=None,
-    initial_freeze_blocks=0,
-):
-    # track best validation choroid-dice
+
+def collate_native_scans(batch):
+    images, paths, sizes, references = zip(*batch)
+    return torch.stack(images), paths, sizes, references
+
+
+@torch.inference_mode()
+def run_native(model, device, args, transform, metadata, dataset=None):
+    """Use one prediction path for saved masks and labeled evaluation."""
+    model.eval()
+    scans = NativeScans(transform, transform.image_mode, dataset=dataset, directory=args.segment_dir)
+    collect_rows = dataset is not None or args.measurements_csv
+    scan_info = [metadata_for(os.path.basename(path), metadata) for path in scans.paths] if collect_rows else []
+    loader = DataLoader(scans, batch_size=args.batch_size, num_workers=args.num_workers,
+                        pin_memory=device.type == "cuda", collate_fn=collate_native_scans)
+    if dataset is None:
+        mask_dir = os.path.join(args.output_dir, "masks")
+        overlay_dir = os.path.join(args.output_dir, "overlays")
+        os.makedirs(mask_dir, exist_ok=True)
+        if args.save_overlay:
+            os.makedirs(overlay_dir, exist_ok=True)
+    rows = []
+    scan_index = 0
+    for images, paths, sizes, references in loader:
+        probabilities = predict_choroid(model, images.to(device), args.tta_hflip).cpu()
+        if not torch.isfinite(probabilities).all():
+            raise ValueError(f"Non-finite probabilities for batch beginning with {paths[0]}.")
+        for probability, path, size, reference in zip(probabilities, paths, sizes, references):
+            mask = native_mask(probability, size, args.threshold, args.postprocess)
+            name = os.path.basename(path)
+            if reference is None:
+                stem = os.path.splitext(name)[0]
+                Image.fromarray(mask.astype(np.uint8) * 255).save(os.path.join(mask_dir, f"{stem}_mask.png"))
+                if args.save_overlay:
+                    overlay = create_overlay_image(load_scan(path, "rgb"), mask)
+                    overlay.save(os.path.join(overlay_dir, f"{stem}_overlay.png"))
+            if collect_rows:
+                info = scan_info[scan_index]
+                spacing = info.axial_um_per_pixel if info.axial_um_per_pixel is not None else args.pixel_size_micrometers
+                metrics = (
+                    thickness_measurements(mask, spacing) if reference is None
+                    else scan_metrics(mask, np.asarray(reference) > 0, spacing)
+                )
+                rows.append({
+                    "image": name, "patient_id": info.patient_id, "scanner": info.scanner,
+                    "axial_um_per_pixel": spacing, **metrics,
+                })
+                scan_index += 1
+    if dataset is None:
+        print(f"Saved {len(scans)} segmentation masks to {mask_dir}.")
+    return rows
+
+
+def write_metrics_csv(path, splits):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    first_row = next(iter(splits.values()))[0]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["split", *first_row])
+        writer.writeheader()
+        for split, rows in splits.items():
+            writer.writerows({"split": split, **row} for row in rows)
+
+
+def report_metrics(rows, split):
+    patient_macro = bool(rows[0]["patient_id"])
+    scanners = sorted({row["scanner"] or "unknown" for row in rows})
+    strata = [(split, rows)]
+    if len(scanners) > 1 or scanners[0] != "unknown":
+        strata.extend((scanner, [row for row in rows if (row["scanner"] or "unknown") == scanner])
+                      for scanner in scanners)
+
+    for name, scans in strata:
+        summary = summarize_scans(scans, patient_macro)
+        averaging = f"{len({row['patient_id'] for row in scans})} patients, patient macro" if patient_macro else "scan macro"
+        print(f"{name} ({len(scans)} scans, {averaging})")
+        print(f"  Dice {summary['dice']:.4f} | Jaccard {summary['jaccard']:.4f} "
+              f"| pixel accuracy {summary['pixel_accuracy']:.4f}")
+        for key, label in (("bm", "BM"), ("csi", "CSI"), ("thickness", "Axial thickness")):
+            for unit in ("um", "px"):
+                mae = summary[f"{key}_mae_{unit}"]
+                bias = summary[f"{key}_bias_{unit}"]
+                if mae is not None:
+                    print(f"  {label}: MAE {mae:.2f}, bias {bias:+.2f} {'µm' if unit == 'um' else 'px'}")
+        coverage = summary["column_coverage"]
+        coverage_text = f"{coverage:.1%}" if coverage is not None else "n/a"
+        missed = sum(row["missed_scan"] for row in scans)
+        print(f"  Reference-column coverage {coverage_text} | scans with no matched columns {missed}")
+    return summarize_scans(rows, patient_macro)
+
+
+def save_checkpoint(path, checkpoint):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=directory, suffix=".pth", delete=False) as temporary:
+        temporary_path = temporary.name
+    try:
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def train_fold(train_loader, evaluate_validation, model, criterion, optimizer, device,
+               scaler, scheduler, args, config, save_best_path, initial_freeze):
     best_choroid = -1.0
+    patience_reference = -1.0
     patience_counter = 0
-    progressive_unfreeze_schedule = progressive_unfreeze_schedule or []
-    current_freeze = int(initial_freeze_blocks)
+    schedule = parse_unfreeze_schedule(args.progressive_unfreeze_schedule)
+    current_freeze = initial_freeze
+    best_rows = None
 
-    for epoch in range(num_epochs):
-        # Optional progressive unfreezing (applies at epoch start, 1-based epochs).
-        if progressive_unfreeze_schedule and hasattr(model, "encoder"):
-            epoch_idx = epoch + 1
-            target_freeze = current_freeze
-            for start_ep, freeze_blocks in progressive_unfreeze_schedule:
-                if epoch_idx >= start_ep:
-                    target_freeze = int(freeze_blocks)
-            if target_freeze != current_freeze:
-                apply_encoder_freeze(model, target_freeze)
-                current_freeze = target_freeze
-                print(f"🔓 Progressive unfreeze update at epoch {epoch_idx}: freeze_encoder_blocks={current_freeze}")
+    for epoch in range(1, args.num_epochs + 1):
+        target_freeze = next((blocks for start, blocks in reversed(schedule) if start <= epoch), initial_freeze)
+        if target_freeze != current_freeze:
+            apply_encoder_freeze(model, target_freeze)
+            current_freeze = target_freeze
+            print(f"Epoch {epoch}: freezing first {current_freeze} encoder blocks.")
 
-        # — training pass —
         model.train()
         running_loss = 0.0
         for images, masks in train_loader:
             images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
-            with autocast('cuda'):
-                outputs = model(images)
-                logits = get_main_logits(outputs)
-                if torch.isnan(logits).any():
-                    print("Warning: Model outputs contain nan values, skipping batch")
-                    continue
+            with autocast(device.type, enabled=device.type == "cuda"):
                 loss = compute_total_loss(
-                    outputs,
-                    masks,
-                    criterion,
-                    aux_weight_d2=aux_weight_d2,
-                    aux_weight_d3=aux_weight_d3,
-                    edge_loss_weight=edge_loss_weight,
+                    model(images), masks, criterion, args.aux_weight_d2, args.aux_weight_d3,
+                    args.edge_loss_weight, args.thickness_loss_weight,
                 )
-                if torch.isnan(loss):
-                    print("Warning: Loss is nan, skipping batch")
-                    continue
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Non-finite training loss in epoch {epoch}.")
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -2317,99 +2236,34 @@ def train_fold(
             scaler.update()
             running_loss += loss.item()
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader):.4f}, LR: {current_lr:.2e}")
-
-        # — validation pass —
-        model.eval()
-        dice_choroid_scores = []
-        with torch.no_grad():
-            for images, masks in valid_loader:
-                images, masks = images.to(device), masks.to(device)
-                outputs = model(images)
-                logits = get_main_logits(outputs)
-                _, dch = dice_score(logits, masks)
-                dice_choroid_scores.append(dch)
-
-        avg_choroid = np.mean(dice_choroid_scores)
-        print(f"  → Validation Choroid Dice: {avg_choroid:.4f}")
+        rows = evaluate_validation()
+        dice = summarize_scans(rows, patient_macro=bool(rows[0]["patient_id"]))["dice"]
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch}/{args.num_epochs}: loss {running_loss / len(train_loader):.4f}, "
+              f"LR {lr:.2e}, validation Dice {dice:.4f}")
         if scheduler is not None:
-            scheduler.step(avg_choroid)
+            scheduler.step(dice)
 
-        # — save best checkpoint —
-        improved = avg_choroid > (best_choroid + early_stopping_min_delta)
-        if improved:
-            best_choroid = avg_choroid
-            patience_counter = 0
-            ckpt = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'val_choroid_dice': best_choroid
-            }
-            os.makedirs(os.path.dirname(save_best_path) or ".", exist_ok=True)
-            torch.save(ckpt, save_best_path)
-            print(f"💾 New best checkpoint saved: {save_best_path}")
+        if dice > best_choroid:
+            best_choroid, best_rows = dice, rows
+            save_checkpoint(save_best_path, {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "model_config": config,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "val_choroid_dice": dice,
+            })
+            print(f"Saved best checkpoint to {save_best_path}.")
+        if dice > patience_reference + args.early_stopping_min_delta:
+            patience_reference, patience_counter = dice, 0
         else:
             patience_counter += 1
-            if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
-                print(f"⏹ Early stopping at epoch {epoch + 1} (patience={early_stopping_patience})")
+            if 0 < args.early_stopping_patience <= patience_counter:
+                print(f"Early stopping at epoch {epoch}.")
                 break
 
-    # Load the best checkpoint before final metrics so reported results match saved model.
-    if os.path.exists(save_best_path):
-        ckpt = torch.load(save_best_path, map_location=device, weights_only=False)
-        state_dict = ckpt.get('model_state_dict', ckpt.get('model', ckpt))
-        state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=config["num_channels"])
-        load_state_dict_flexible(model, state_dict)
-        print(f"🔁 Loaded best checkpoint for final evaluation: {save_best_path}")
-
-    # — after all epochs, run full evaluation on validation & test sets as before —
-
-    model.eval()
-    dice_combined_scores, dice_choroid_scores = [], []
-    upper_signed_errors, upper_unsigned_errors, lower_signed_errors, lower_unsigned_errors = [], [], [], []
-    with torch.no_grad():
-        for images, masks in valid_loader:
-            images, masks = images.to(device), masks.to(device)
-            outputs = model(images)
-            logits = get_main_logits(outputs)
-            dice_combined, dice_choroid = dice_score(logits, masks)
-            dice_combined_scores.append(dice_combined)
-            dice_choroid_scores.append(dice_choroid)
-            predicted_masks = torch.softmax(logits, dim=1).cpu().numpy()
-            true_masks = masks.cpu().numpy()
-            for i in range(images.size(0)):
-                pm = (predicted_masks[i,1] > threshold).astype(np.uint8)
-                tm = (true_masks[i,1] == 1).astype(np.uint8)
-                pu, pl = find_boundaries(pm)
-                gu, gl = find_boundaries(tm)
-                us, uu = compute_errors(pu, gu, args.pixel_size_micrometers)
-                ls, lu = compute_errors(pl, gl, args.pixel_size_micrometers)
-                upper_signed_errors.append(us)
-                upper_unsigned_errors.append(uu)
-                lower_signed_errors.append(ls)
-                lower_unsigned_errors.append(lu)
-
-    avg_dice_combined = np.mean(dice_combined_scores)
-    avg_dice_choroid = np.mean(dice_choroid_scores)
-    avg_upper_signed_error = np.mean(upper_signed_errors)
-    avg_upper_unsigned_error = np.mean(upper_unsigned_errors)
-    avg_lower_signed_error = np.mean(lower_signed_errors)
-    avg_lower_unsigned_error = np.mean(lower_unsigned_errors)
-
-    # Visualize the first batch from the test set
-    with torch.no_grad():
-        for images, masks in test_loader:
-            images, masks = images.to(device), masks.to(device)
-            logits = get_main_logits(model(images))
-            outputs = torch.softmax(logits, dim=1)
-            masks = F.interpolate(masks, size=outputs.shape[2:], mode='nearest')
-            plot_boundaries(images, masks, outputs, threshold)
-            break
-
-    return avg_dice_combined, avg_dice_choroid, avg_upper_signed_error, avg_upper_unsigned_error, avg_lower_signed_error, avg_lower_unsigned_error
+    return best_rows
 
 
 def append_ablation_results(csv_path, preset, save_best_path, metrics):
@@ -2422,12 +2276,12 @@ def append_ablation_results(csv_path, preset, save_best_path, metrics):
         "use_fusion": int(ABLATION_PRESETS[preset]["use_fusion"]),
         "use_upconvs": int(ABLATION_PRESETS[preset]["use_upconvs"]),
         "best_checkpoint": save_best_path,
-        "dice_combined": float(metrics[0]),
-        "dice_choroid": float(metrics[1]),
-        "upper_signed_um": float(metrics[2]),
-        "upper_unsigned_um": float(metrics[3]),
-        "lower_signed_um": float(metrics[4]),
-        "lower_unsigned_um": float(metrics[5]),
+        "dice_combined": metrics["pixel_accuracy"],
+        "dice_choroid": metrics["dice"],
+        "upper_signed_um": metrics["bm_bias_um"],
+        "upper_unsigned_um": metrics["bm_mae_um"],
+        "lower_signed_um": metrics["csi_bias_um"],
+        "lower_unsigned_um": metrics["csi_mae_um"],
     }
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -2437,384 +2291,112 @@ def append_ablation_results(csv_path, preset, save_best_path, metrics):
     print(f"📝 Ablation metrics appended to: {csv_path}")
 
 
-class OCTSegmentationDataset(torch.utils.data.Dataset):
-    def __init__(self, image_dir, image_size, transform=None, image_mode='rgb'):
-        self.image_size = image_size
-        self.transform = transform
-        self.image_mode = str(image_mode).strip().lower()
-        if self.image_mode not in {'rgb', 'gray'}:
-            raise ValueError(f"image_mode must be 'rgb' or 'gray', got {image_mode}")
-        # Supported extensions
-        exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-        # Build list of image paths
-        self.image_paths = []
-        for fname in os.listdir(image_dir):
-            _, ext = os.path.splitext(fname)
-            if ext.lower() in exts:
-                self.image_paths.append(os.path.join(image_dir, fname))
-        # Sort for consistent ordering
-        self.image_paths = sorted(self.image_paths)
+def build_training_datasets(args, config, metadata):
+    image_mode = "gray" if config["num_channels"] == 1 else "rgb"
+    image_size = config["image_size"]
+    train = OCTDataset(args.image_dir, args.mask_dir, image_size,
+                       transform=make_train_transform(args, config), image_mode=image_mode, strict_pairs=bool(metadata))
+    if args.val_image_dir:
+        valid = OCTDataset(args.val_image_dir, args.val_mask_dir, image_size, image_mode=image_mode, strict_pairs=True)
+        if {os.path.realpath(path) for path in train.image_paths} & {os.path.realpath(path) for path in valid.image_paths}:
+            raise ValueError("The explicit training and validation sets share image paths.")
+        if metadata:
+            def patients(dataset):
+                return {metadata_for(os.path.basename(path), metadata).patient_id for path in dataset.image_paths}
 
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        pil_mode = 'L' if self.image_mode == 'gray' else 'RGB'
-        image = Image.open(img_path).convert(pil_mode)
-        original_size = image.size  # This returns (width, height)
-        if self.transform:
-            image = self.transform(image)
-        return image, os.path.basename(img_path), original_size
-
-if __name__ == '__main__':
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Using device: {device}")
-    print(
-        f"🧪 Ablation preset: {config['ablation_preset']} | "
-        f"attention={config['use_attention']} fusion={config['use_fusion']} upconvs={config['use_upconvs']}"
-    )
-    
-    model = AttentionUNetViT(config).to(device)
-    
-    # Initial freeze policy for ViT blocks (supports progressive unfreezing later).
-    apply_encoder_freeze(model, args.freeze_encoder_blocks)
-    print(f"🔒 Frozen encoder blocks: first {args.freeze_encoder_blocks}")
-    if args.enable_encoder_adapters:
-        trainable_adapter_params = sum(p.numel() for p in model.encoder_adapters.parameters() if p.requires_grad)
-        print(
-            f"🧩 Adapter training enabled | rank={args.adapter_rank} "
-            f"blocks={model.adapter_block_indices} trainable_params={trainable_adapter_params}"
-        )
-
-    # ===== SEGMENTATION MODE (No masks needed) =====
-    if args.segment_dir:
-        print(f"🔍 Running segmentation on images in: {args.segment_dir}")
-        
-        # Create segmentation dataset
-        segment_dataset = OCTSegmentationDataset(
-            args.segment_dir,
-            args.image_size,
-            transform=image_only_transform,
-            image_mode=args.image_mode,
-        )
-        
-        # Custom collate function to handle original sizes as tuples
-        def custom_collate(batch):
-            images = torch.stack([item[0] for item in batch])
-            filenames = [item[1] for item in batch]
-            # Keep original_sizes as list of tuples instead of converting to tensor
-            original_sizes = [item[2] for item in batch]
-            return images, filenames, original_sizes
-        
-        segment_loader = DataLoader(
-            segment_dataset, 
-            batch_size=args.batch_size,
-            shuffle=False, 
-            num_workers=args.num_workers, 
-            pin_memory=True,
-            collate_fn=custom_collate
-        )
-        
-        # Load model weights
-        if os.path.exists(config['retfound_weights_path']):
-            checkpoint = torch.load(config['retfound_weights_path'], map_location=device, weights_only=False)
-            
-            # Extract model state dict
-            if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            elif 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            else:
-                state_dict = checkpoint
-                
-            state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=config["num_channels"])
-            load_state_dict_flexible(model, state_dict)
-            print(f"✅ Loaded weights from {config['retfound_weights_path']}")
+            if patients(train) & patients(valid):
+                raise ValueError("The explicit training and validation sets share patient IDs.")
         else:
-            print(f"❌ Error: Weight file not found at {config['retfound_weights_path']}")
-            sys.exit(1)
-        
-        model.eval()
-        
-        # CRITICAL FIX: Only collect necessary data (no image tensors)
-        all_filenames = []
-        all_original_sizes = []
-        all_predicted_masks = []
-        
-        print(f"⚙️ Processing {len(segment_dataset)} images...")
-        with torch.no_grad():
-            for batch_idx, (images, filenames, original_sizes) in enumerate(segment_loader):
-                images = images.to(device)
-                outputs = model(images)
-                logits = get_main_logits(outputs)
-                predicted_masks = torch.softmax(logits, dim=1)
-                
-                # Collect only what we need for saving
-                all_filenames.extend(filenames)
-                all_original_sizes.extend(original_sizes)
-                all_predicted_masks.append(predicted_masks.cpu())
-                
-                print(f"✅ Processed batch {batch_idx + 1}/{len(segment_loader)} ({len(filenames)} images)")
-        
-        # Concatenate all batches of masks
-        all_predicted_masks = torch.cat(all_predicted_masks, dim=0)
-        
-        # Save results using ORIGINAL images from disk
-        save_segmentation_results(
-            all_filenames, 
-            all_original_sizes, 
-            all_predicted_masks, 
-            args.output_dir, 
-            args.segment_dir,  # Pass original image directory
-            args.save_overlay, 
-            args.threshold
-        )
-        
-        print(f"\n🎉 Segmentation completed successfully!")
-        print(f"   ► Results saved to: {args.output_dir}")
-        print(f"   ► Masks directory: {os.path.join(args.output_dir, 'masks')}")
-        if args.save_overlay:
-            print(f"   ► Overlays directory: {os.path.join(args.output_dir, 'overlays')}")
-        sys.exit(0)
+            print("Warning: explicit train/validation folders were supplied without patient metadata.")
+        return train, valid, None
 
-    # ===== TRAINING MODE =====
-    assert args.image_dir and args.mask_dir, (
-        '❌ --image_dir and --mask_dir are required for training. '
-        'Use --segment_dir for inference without masks.'
-    )
-    
-    # Load pre-trained weights if specified
-    if args.weights_type in ['retfound', 'rfa-unet'] and os.path.exists(config["retfound_weights_path"]):
-        checkpoint = torch.load(config["retfound_weights_path"], map_location=device, weights_only=False)
-        
-        # Extract model state dict
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        else:
-            state_dict = checkpoint
-            
-        state_dict = adapt_patch_embed_in_channels(state_dict, target_in_channels=config["num_channels"])
-        load_state_dict_flexible(model, state_dict)
-        print(f"✅ Loaded weights from {config['retfound_weights_path']}")
-    
-    # Setup training components
-    class_weights = parse_class_weights(args.class_weights, num_classes=2)
-    criterion = TverskyLoss(
-        alpha=0.7,
-        beta=0.3,
-        smooth=1e-6,
-        class_weights=class_weights,
-        mode=args.loss_mode,
-        choroid_class_idx=1,
-    ).to(device)
-    # Keep all params in optimizer so progressively-unfrozen blocks start updating immediately.
-    trainable_params = model.parameters()
-    if args.optimizer == 'adamw':
-        optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    if not (0.0 < args.test_split < 1.0 and 0.0 < args.val_split_in_trainval < 1.0):
+        raise ValueError("Test and validation fractions must be in (0, 1).")
+    if metadata:
+        train_idx, val_idx, test_idx = split_patients(
+            train.image_paths, metadata, args.test_split, args.val_split_in_trainval, args.seed,
+        )
     else:
-        optimizer = optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
+        print("Warning: splitting by scan. Supply --metadata_csv to keep each patient in one split.")
+        total = len(train)
+        if total < 3:
+            raise ValueError("Automatic train/validation/test splitting needs at least three scans.")
+        test_size = max(1, min(round(total * args.test_split), total - 2))
+        trainval_size = total - test_size
+        val_size = max(1, min(round(trainval_size * args.val_split_in_trainval), trainval_size - 1))
+        train_size = trainval_size - val_size
+        indices = torch.randperm(total, generator=torch.Generator().manual_seed(args.seed)).tolist()
+        train_idx, val_idx, test_idx = indices[:train_size], indices[train_size:trainval_size], indices[trainval_size:]
+    return Subset(train, train_idx), Subset(train, val_idx), Subset(train, test_idx)
+
+
+def main():
+    args = parse_args()
+    validate_args(args)
+    set_seed(args.seed)
+    metadata = read_metadata(args.metadata_csv)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, config = checkpoint_model(args, device)
+    image_mode = "gray" if config["num_channels"] == 1 else "rgb"
+    image_size = config["image_size"]
+    eval_transform = JointSegmentationTransform(
+        image_size, normalize=config["normalize_imagenet"], image_mode=image_mode,
+    )
+    print(f"Using {device} with {image_size}×{image_size} {image_mode} model input.")
+
+    if args.segment_dir:
+        rows = run_native(model, device, args, eval_transform, metadata)
+        write_metrics_csv(args.measurements_csv, {"segmentation": rows})
+        return
+    if args.test_only:
+        test_dataset = OCTDataset(args.test_image_dir, args.test_mask_dir, image_size,
+                                  image_mode=image_mode, strict_pairs=True)
+        rows = run_native(model, device, args, eval_transform, metadata, test_dataset)
+        report_metrics(rows, "External test")
+        write_metrics_csv(args.metrics_csv, {"external_test": rows})
+        return
+
+    train, valid, test = build_training_datasets(args, config, metadata)
+    train_loader = DataLoader(train, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=device.type == "cuda")
+    print(f"Training scans: {len(train)} | validation: {len(valid)} | held-out: {len(test) if test is not None else 0}")
+    initial_freeze = args.freeze_encoder_blocks
+    if initial_freeze is None:
+        initial_freeze = 0 if args.weights_type == "none" else 21
+    apply_encoder_freeze(model, initial_freeze)
+    criterion = TverskyLoss(
+        class_weights=parse_class_weights(args.class_weights, num_classes=2),
+        mode=args.loss_mode, released_layout=model.released_layout,
+    ).to(device)
+    optimizer_type = optim.AdamW if args.optimizer == "adamw" else optim.Adam
+    # Include frozen blocks so progressive unfreezing does not require a new optimizer.
+    optimizer = optimizer_type(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = GradScaler("cuda", enabled=device.type == "cuda")
     scheduler = None
-    if args.scheduler == 'plateau':
+    if args.scheduler == "plateau":
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='max',
-            factor=args.scheduler_factor,
-            patience=args.scheduler_patience,
+            optimizer, mode="max", factor=args.scheduler_factor, patience=args.scheduler_patience,
         )
     save_best_path = args.save_best_path or os.path.join("weights", f"best_rfa_unet_{args.ablation_preset}.pth")
-    
-    if args.val_image_dir and args.val_mask_dir:
-        # Explicit fold-based split: train on image_dir/mask_dir, validate on val_* dirs.
-        train_dataset = OCTDataset(
-            args.image_dir,
-            args.mask_dir,
-            args.image_size,
-            transform=train_transform,
-            num_classes=2,
-            image_mode=args.image_mode,
-        )
-        valid_dataset = OCTDataset(
-            args.val_image_dir,
-            args.val_mask_dir,
-            args.image_size,
-            transform=val_test_transform,
-            num_classes=2,
-            image_mode=args.image_mode,
-        )
-        # Keep a test loader object for visualization code-path compatibility.
-        test_dataset = valid_dataset
-        split_policy_msg = "explicit-fold (train dirs + val dirs)"
-    else:
-        # Prepare datasets (split by indices to keep train/eval transforms isolated).
-        full_dataset_eval = OCTDataset(
-            args.image_dir,
-            args.mask_dir,
-            args.image_size,
-            transform=val_test_transform,
-            num_classes=2,
-            image_mode=args.image_mode,
-        )
-        if not (0.0 < args.test_split < 1.0):
-            raise ValueError(f"--test_split must be in (0,1), got {args.test_split}")
-        if not (0.0 < args.val_split_in_trainval < 1.0):
-            raise ValueError(f"--val_split_in_trainval must be in (0,1), got {args.val_split_in_trainval}")
 
-        total_size = len(full_dataset_eval)
-        test_size = int(round(total_size * args.test_split))
-        test_size = max(1, min(test_size, total_size - 2))
-        trainval_size = total_size - test_size
-        valid_size = int(round(trainval_size * args.val_split_in_trainval))
-        valid_size = max(1, min(valid_size, trainval_size - 1))
-        train_size = trainval_size - valid_size
-        split_generator = torch.Generator().manual_seed(args.seed)
-        indices = torch.randperm(total_size, generator=split_generator).tolist()
-        train_indices = indices[:train_size]
-        valid_indices = indices[train_size:train_size + valid_size]
-        test_indices = indices[train_size + valid_size:]
+    def evaluate_validation():
+        return run_native(model, device, args, eval_transform, metadata, valid)
 
-        full_dataset_train = OCTDataset(
-            args.image_dir,
-            args.mask_dir,
-            args.image_size,
-            transform=train_transform,
-            num_classes=2,
-            image_mode=args.image_mode,
-        )
-        train_dataset = Subset(full_dataset_train, train_indices)
-        valid_dataset = Subset(full_dataset_eval, valid_indices)
-        test_dataset = Subset(full_dataset_eval, test_indices)
-        split_policy_msg = f"random split: test_split={args.test_split}, val_split_in_trainval={args.val_split_in_trainval}"
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    
-    print(f"\n📊 Dataset Information:")
-    print(f"   • Training samples: {len(train_dataset)}")
-    print(f"   • Validation samples: {len(valid_dataset)}")
-    print(f"   • Test samples: {len(test_dataset)}")
-    print(f"   • Split policy: {split_policy_msg}")
-    print(f"   • Image mode/channels: {args.image_mode}/{config['num_channels']}")
-    print(f"   • LR: {args.lr}")
-    print(f"   • Optimizer: {args.optimizer}")
-    print(f"   • Weight decay: {args.weight_decay}")
-    print(f"   • Grad clip: {args.grad_clip}")
-    print(f"   • Class weights: {class_weights}")
-    print(f"   • Loss mode: {args.loss_mode}")
-    print(f"   • Edge loss weight: {args.edge_loss_weight}")
-    print(f"   • Decoder architecture: {args.decoder_arch}")
-    if args.decoder_arch == "transunet":
-        print(
-            f"   • TransUNet hybrid skips (R50): {args.transunet_hybrid_skips} "
-            f"(pretrained={args.transunet_r50_pretrained}, freeze={args.transunet_freeze_r50})"
-        )
-    if args.decoder_arch == "fundu":
-        print(
-            f"   • Fundu mask-decoder layers: {args.fundu_decoder_layers} "
-            f"(Segmenter-style mask transformer + progressive post-adapter)"
-        )
-    print(f"   • Multiscale skip mode: {args.multiscale_skip_mode}")
-    print(
-        f"   • Post-refine head: {args.use_post_refine} "
-        f"(depth={args.post_refine_depth}, ch={args.post_refine_channels})"
-    )
-    print(f"   • Shallow stem fusion: {args.use_shallow_stem_fusion}")
-    print(f"   • Deep supervision: {args.deep_supervision} (w_d2={args.aux_weight_d2}, w_d3={args.aux_weight_d3})")
-    print(f"   • ImageNet normalization: {args.normalize_imagenet}")
-    print(
-        f"   • Pre-adapter: {args.use_pre_adapter} "
-        f"(target={args.pre_adapter_target_size}, hidden={args.pre_adapter_hidden_channels}, "
-        f"depth={args.pre_adapter_depth}, norm={args.pre_adapter_norm}, mode={args.pre_adapter_mode}, "
-        f"res_scale_init={args.pre_adapter_residual_scale_init}, "
-        f"rgb_scalars={args.pre_adapter_rgb_scalars})"
-    )
-    print(
-        f"   • OCT intensity aug: {args.oct_intensity_aug} "
-        f"(b={args.oct_brightness_jitter}, c={args.oct_contrast_jitter}, "
-        f"gamma=[{args.oct_gamma_min},{args.oct_gamma_max}], "
-        f"speckle_p/std=[{args.oct_speckle_prob},{args.oct_speckle_std_min}-{args.oct_speckle_std_max}], "
-        f"noise_p/std=[{args.oct_noise_prob},{args.oct_noise_std_min}-{args.oct_noise_std_max}], "
-        f"blur_p/smax=[{args.oct_blur_prob},{args.oct_blur_sigma_max}])"
-    )
-    print(
-        f"   • Augment: crop={args.augment_random_resized_crop}(scale_min={args.augment_scale_min}), "
-        f"hflip_p={args.augment_hflip_prob}, rot={args.augment_rotation_deg}, jitter={args.augment_color_jitter}"
-    )
-    print(f"   • Scheduler: {args.scheduler}")
-    if args.scheduler == 'plateau':
-        print(f"   • Scheduler factor/patience: {args.scheduler_factor}/{args.scheduler_patience}")
-    print(f"   • Freeze encoder blocks: {args.freeze_encoder_blocks}")
-    print(f"   • Progressive unfreeze schedule: '{args.progressive_unfreeze_schedule}'")
-    print(
-        f"   • Encoder adapters: {args.enable_encoder_adapters} "
-        f"(rank={args.adapter_rank}, blocks='{args.adapter_blocks}', "
-        f"dropout={args.adapter_dropout}, init_scale={args.adapter_init_scale}, "
-        f"placement={args.adapter_placement})"
-    )
-    print(f"   • Early stopping patience/min_delta: {args.early_stopping_patience}/{args.early_stopping_min_delta}")
-    print(f"   • Best checkpoint path: {save_best_path}")
-    print(f"   • Starting training for {args.num_epochs} epochs...")
-    
-    # Train the model
-    dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned = train_fold(
-        train_loader,
-        valid_loader,
-        test_loader,
-        model,
-        criterion,
-        optimizer,
-        device,
-        args.num_epochs,
-        scaler,
-        args.threshold,
-        save_best_path,
-        scheduler=scheduler,
-        early_stopping_patience=args.early_stopping_patience,
-        early_stopping_min_delta=args.early_stopping_min_delta,
-        aux_weight_d2=args.aux_weight_d2,
-        aux_weight_d3=args.aux_weight_d3,
-        edge_loss_weight=args.edge_loss_weight,
-        progressive_unfreeze_schedule=PROGRESSIVE_UNFREEZE_PLAN,
-        initial_freeze_blocks=args.freeze_encoder_blocks,
-    )
-    
-    # Print final results
-    print(f"\n🏁 Final Validation Results:")
-    print(f"   • Dice (Combined): {dice_combined:.4f}")
-    print(f"   • Dice (Choroid): {dice_choroid:.4f}")
-    print(f"   • Upper Boundary Signed Error: {upper_signed:.2f} μm")
-    print(f"   • Upper Boundary Unsigned Error: {upper_unsigned:.2f} μm")
-    print(f"   • Lower Boundary Signed Error: {lower_signed:.2f} μm")
-    print(f"   • Lower Boundary Unsigned Error: {lower_unsigned:.2f} μm")
+    validation_rows = train_fold(train_loader, evaluate_validation, model, criterion, optimizer, device,
+                                 scaler, scheduler, args, config, save_best_path, initial_freeze)
+    del optimizer, scheduler
+    summary = report_metrics(validation_rows, "Best-checkpoint validation")
+    splits = {"validation": validation_rows}
+    if test is not None:
+        model.load_state_dict(load_checkpoint(save_best_path)["model_state_dict"])
+        test_rows = run_native(model, device, args, eval_transform, metadata, test)
+        report_metrics(test_rows, "Held-out test")
+        splits["heldout_test"] = test_rows
+    write_metrics_csv(args.metrics_csv, splits)
 
     if args.ablation_results_csv:
-        append_ablation_results(
-            csv_path=args.ablation_results_csv,
-            preset=args.ablation_preset,
-            save_best_path=save_best_path,
-            metrics=(dice_combined, dice_choroid, upper_signed, upper_unsigned, lower_signed, lower_unsigned),
-        )
+        append_ablation_results(args.ablation_results_csv, config["ablation_preset"], save_best_path, summary)
+
+
+if __name__ == "__main__":
+    main()

@@ -16,34 +16,24 @@ sys.path.insert(0, os.path.abspath("src"))
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from rfa_u_net import AttentionUNetViT, OCTDataset, val_test_transform
+from rfa_u_net import JointSegmentationTransform, OCTDataset, checkpoint_model, parse_args, predict_choroid
+from choroid import native_mask
 
 # %%
-# 1) Model config & load
-config = {
-    "image_size": 224,
-    "hidden_dim": 1024,
-    "patch_size": 16,
-    "num_channels": 3,
-    "num_classes": 2,
-    "retfound_weights_path": "weights/best_rfa_unet.pth",
-}
+args = parse_args(["--weights_type", "rfa-unet"])
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = AttentionUNetViT(config).to(device)
-
-# load checkpoint (allow full dict or just state_dict)
-ckpt = torch.load(config["retfound_weights_path"], map_location=device, weights_only=False)
-state_dict = ckpt.get("model_state_dict", ckpt)
-model.load_state_dict(state_dict, strict=False)
+model, config = checkpoint_model(args, device)
 model.eval()
-print(f"✅ Loaded weights from {config['retfound_weights_path']}")
+image_mode = "gray" if config["num_channels"] == 1 else "rgb"
+transform = JointSegmentationTransform(
+    config["image_size"], normalize=config["normalize_imagenet"], image_mode=image_mode,
+)
 
 # %%
-def viz_four_panel(image, true_mask, pred_prob, thresh=0.5):
+def viz_four_panel(image, true_mask, pred_bin):
     """
-    image:    torch.Tensor [1,3,H,W]
-    true_mask/numpy [H,W] {0,1}
-    pred_prob/numpy [H,W] probabilities
+    image: PIL image
+    true_mask and pred_bin: native-resolution binary NumPy arrays
     """
     H, W = true_mask.shape
     # compute boundaries
@@ -59,8 +49,7 @@ def viz_four_panel(image, true_mask, pred_prob, thresh=0.5):
                 low.append(np.nan)
         return up, low
 
-    img = image.cpu().squeeze(0).permute(1,2,0).numpy()
-    pred_bin = (pred_prob > thresh).astype(np.uint8)
+    img = np.asarray(image.convert("RGB"))
     tu, tl = boundaries(true_mask)
     pu, pl = boundaries(pred_bin)
 
@@ -81,14 +70,11 @@ def viz_four_panel(image, true_mask, pred_prob, thresh=0.5):
 # 2) Run inference & visualize first 20 samples
 test_image_dir = "path/to/data"
 test_mask_dir  = "path/to/mask"
-ds = OCTDataset(test_image_dir, test_mask_dir, config["image_size"], transform=val_test_transform)
+ds = OCTDataset(test_image_dir, test_mask_dir, config["image_size"], image_mode=image_mode)
 
 for i in range(min(20, len(ds))):
-    img, gt_oh = ds[i]
-    true_mask = gt_oh[1].numpy()  # only choroid channel
-
-    with torch.no_grad():
-        out  = model(img.unsqueeze(0).to(device))
-        prob = torch.sigmoid(out)[0,1].cpu().numpy()
-
-    viz_four_panel(img, true_mask, prob, thresh=0.5)
+    image, reference = ds.load_pair(i)
+    with torch.inference_mode():
+        probability = predict_choroid(model, transform(image).unsqueeze(0).to(device))[0].cpu()
+    mask = native_mask(probability, image.size, 0.5)
+    viz_four_panel(image, np.asarray(reference) > 0, mask)

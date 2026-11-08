@@ -13,3 +13,7 @@ Temporary files
 Jupyter
 
 *.ipynb_checkpoints/
+
+# Python cache directories and local model checkpoints
+__pycache__/
+weights/*.pth
