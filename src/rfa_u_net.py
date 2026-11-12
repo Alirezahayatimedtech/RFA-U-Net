@@ -273,11 +273,9 @@ def parse_args(argv=None):
     parser.add_argument('--val_image_dir', type=str, default=None, help='Optional validation-image directory for explicit fold-based training')
     parser.add_argument('--val_mask_dir', type=str, default=None, help='Optional validation-mask directory for explicit fold-based training')
     parser.add_argument('--weights_path', type=str, default=None,
-                        help='Path to a local pretrained checkpoint')
-    parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet', 'refiner'],
-                        help='Model weights: random, RETFound encoder, RFA-U-Net, or trained choroid refiner')
-    parser.add_argument('--prior_repo', help='Local Choroidalyzer checkout for a refiner trained with a prior')
-    parser.add_argument('--prior_weights', help='Local Choroidalyzer v1.0 weights for the prior')
+                        help='Path to the pre-trained weights file (used if weights_type is retfound or rfa-unet)')
+    parser.add_argument('--weights_type', type=str, default='none', choices=['none', 'retfound', 'rfa-unet'],
+                        help='Type of weights to load: "none" for random initialization, "retfound" for RETFound weights (training from scratch), "rfa-unet" for pre-trained RFA-U-Net weights (inference/fine-tuning)')
     parser.add_argument('--image_size', type=int, default=224, help='Input image size')
     parser.add_argument('--image_mode', type=str, default='gray', choices=['rgb', 'gray'],
                         help='Input image channel mode: gray uses true 1-channel pipeline; rgb keeps legacy 3-channel')
@@ -294,10 +292,10 @@ def parse_args(argv=None):
     parser.add_argument('--metadata_csv', help='CSV with image, patient_id and optional scanner, axial_um_per_pixel')
     parser.add_argument('--measurements_csv', help='Write per-scan axial thickness during --segment_dir inference')
     parser.add_argument('--metrics_csv', help='Write native-resolution per-scan evaluation metrics')
-    parser.add_argument('--tta_hflip', action=argparse.BooleanOptionalAction, default=None, help='Average predictions from original and horizontally flipped scans')
-    parser.add_argument('--postprocess', choices=['none', 'layer'],
+    parser.add_argument('--tta_hflip', action='store_true', help='Average original and horizontal-flip probabilities')
+    parser.add_argument('--postprocess', choices=['none', 'layer'], default='none',
                         help='Optional largest connected choroid band with within-column hole filling')
-    parser.add_argument('--threshold', type=float, default=None, help='Threshold for binarizing predicted masks')
+    parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binarizing predicted masks')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible data split')
     parser.add_argument('--ablation_preset', type=str, default='full', choices=list(ABLATION_PRESETS.keys()),
                         help='Ablation preset for decoder: baseline/attention/fusion/up-convs combinations')
@@ -636,7 +634,7 @@ def validate_args(args):
 
     if bool(args.val_image_dir) ^ bool(args.val_mask_dir):
         raise ValueError("--val_image_dir and --val_mask_dir must be provided together")
-    if args.threshold is not None and not 0.0 < args.threshold < 1.0:
+    if not 0.0 < args.threshold < 1.0:
         raise ValueError("--threshold must be in (0, 1).")
     if not np.isfinite(args.thickness_loss_weight) or args.thickness_loss_weight < 0:
         raise ValueError("--thickness_loss_weight must be finite and nonnegative.")
@@ -648,14 +646,10 @@ def validate_args(args):
         raise ValueError("Choose either --test_only or --segment_dir.")
     if args.test_only and not (args.test_image_dir and args.test_mask_dir):
         raise ValueError("--test_only requires --test_image_dir and --test_mask_dir.")
-    if args.test_only or args.segment_dir:
-        if args.weights_type not in {"rfa-unet", "refiner"}:
-            raise ValueError("Inference requires --weights_type rfa-unet or --weights_type refiner.")
-    else:
-        if args.weights_type == "refiner":
-            raise ValueError("Use benchmarks/train_oimhs_refiner.py to train a refiner checkpoint.")
-        if not (args.image_dir and args.mask_dir):
-            raise ValueError("Training requires --image_dir and --mask_dir.")
+    if not (args.test_only or args.segment_dir) and not (args.image_dir and args.mask_dir):
+        raise ValueError("Training requires --image_dir and --mask_dir.")
+    if (args.test_only or args.segment_dir) and args.weights_type != "rfa-unet":
+        raise ValueError("Inference requires a trained checkpoint. Use --weights_type rfa-unet.")
     if args.measurements_csv and not args.segment_dir:
         raise ValueError("--measurements_csv requires --segment_dir.")
     if args.num_epochs < 1:
@@ -2099,21 +2093,19 @@ class NativeScans(torch.utils.data.Dataset):
             image, reference = self.dataset.load_pair(index)
         else:
             image, reference = load_scan(path, self.image_mode), None
-        tensor_or_image = self.transform(image) if self.transform is not None else image
-        return tensor_or_image, path, image.size, reference
+        return self.transform(image), path, image.size, reference
 
 
 def collate_native_scans(batch):
     images, paths, sizes, references = zip(*batch)
-    return (torch.stack(images) if torch.is_tensor(images[0]) else images), paths, sizes, references
+    return torch.stack(images), paths, sizes, references
 
 
 @torch.inference_mode()
 def run_native(model, device, args, transform, metadata, dataset=None):
     """Use one prediction path for saved masks and labeled evaluation."""
     model.eval()
-    image_mode = transform.image_mode if transform is not None else "gray"
-    scans = NativeScans(transform, image_mode, dataset=dataset, directory=args.segment_dir)
+    scans = NativeScans(transform, transform.image_mode, dataset=dataset, directory=args.segment_dir)
     collect_rows = dataset is not None or args.measurements_csv
     scan_info = [metadata_for(os.path.basename(path), metadata) for path in scans.paths] if collect_rows else []
     loader = DataLoader(scans, batch_size=args.batch_size, num_workers=args.num_workers,
@@ -2127,13 +2119,10 @@ def run_native(model, device, args, transform, metadata, dataset=None):
     rows = []
     scan_index = 0
     for images, paths, sizes, references in loader:
-        if transform is None:
-            probabilities = (model.predict(image, args.tta_hflip) for image in images)
-        else:
-            probabilities = predict_choroid(model, images.to(device), args.tta_hflip).cpu()
+        probabilities = predict_choroid(model, images.to(device), args.tta_hflip).cpu()
+        if not torch.isfinite(probabilities).all():
+            raise ValueError(f"Non-finite probabilities for batch beginning with {paths[0]}.")
         for probability, path, size, reference in zip(probabilities, paths, sizes, references):
-            if not torch.isfinite(probability).all():
-                raise ValueError(f"Non-finite probabilities for {path}.")
             mask = native_mask(probability, size, args.threshold, args.postprocess)
             name = os.path.basename(path)
             if reference is None:
@@ -2347,29 +2336,13 @@ def main():
     set_seed(args.seed)
     metadata = read_metadata(args.metadata_csv)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    threshold, flip, postprocess = 0.5, False, "none"
-    if args.weights_type == "refiner":
-        from choroid_refiner import GRID, NativeRefiner, checkpoint_settings
-
-        default_weights = os.path.join(os.path.dirname(__file__), "..", "weights", "oimhs_refiner.safetensors")
-        weights = args.weights_path or default_weights
-        with_prior, threshold, flip, postprocess = checkpoint_settings(weights)
-        model = NativeRefiner(weights, with_prior, device, args.prior_repo, args.prior_weights)
-        image_mode, image_size = "gray", GRID[0]
-        eval_transform = None
-        print(f"Using {device} with OCT refiner {weights}.")
-    else:
-        model, config = checkpoint_model(args, device)
-        image_mode = "gray" if config["num_channels"] == 1 else "rgb"
-        image_size = config["image_size"]
-        eval_transform = JointSegmentationTransform(
-            image_size, normalize=config["normalize_imagenet"], image_mode=image_mode,
-        )
-        print(f"Using {device} with {image_size}×{image_size} {image_mode} model input.")
-
-    args.threshold = threshold if args.threshold is None else args.threshold
-    args.tta_hflip = flip if args.tta_hflip is None else args.tta_hflip
-    args.postprocess = postprocess if args.postprocess is None else args.postprocess
+    model, config = checkpoint_model(args, device)
+    image_mode = "gray" if config["num_channels"] == 1 else "rgb"
+    image_size = config["image_size"]
+    eval_transform = JointSegmentationTransform(
+        image_size, normalize=config["normalize_imagenet"], image_mode=image_mode,
+    )
+    print(f"Using {device} with {image_size}×{image_size} {image_mode} model input.")
 
     if args.segment_dir:
         rows = run_native(model, device, args, eval_transform, metadata)

@@ -10,4 +10,3 @@ tqdm>=4.61.0
 Pillow>=9.1
 gdown>=4.7.1
 huggingface-hub>=0.15.0
-safetensors>=0.4.5

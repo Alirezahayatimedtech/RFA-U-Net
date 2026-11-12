@@ -24,7 +24,7 @@ BASELINE = (False, "none", 0.5)
 FIELDS = ("dice", "jaccard", "bm_mae_px", "csi_mae_px", "thickness_mae_px", "column_coverage")
 
 
-def patient_scans(archive):
+def central_scans(archive):
     eyes = {}
     for name in archive.namelist():
         match = re.fullmatch(r"Images/(\d+)/(\d+)\.png", name)
@@ -43,15 +43,14 @@ def patient_scans(archive):
     if len(patient_eyes) != 119 or {eye for ids in patient_eyes.values() for eye in ids} != set(eyes):
         raise ValueError("OIMHS demographics do not match the archive's eye folders.")
 
-    return {patient: [name for _, name in sorted(eyes[min(eye_ids)])]
-            for patient, eye_ids in patient_eyes.items()}
+    selected = {}
+    for patient, eye_ids in patient_eyes.items():
+        scans = sorted(eyes[min(eye_ids)])
+        selected[patient] = scans[len(scans) // 2][1]
+    return selected
 
 
-def central_scans(archive):
-    return {patient: scans[len(scans) // 2] for patient, scans in patient_scans(archive).items()}
-
-
-def load_scan_and_labels(archive, member):
+def load_scan_and_mask(archive, member):
     with Image.open(io.BytesIO(archive.read(member))) as source:
         image = source.convert("RGB")
     width, height = image.size
@@ -62,11 +61,6 @@ def load_scan_and_labels(archive, member):
     labels = np.asarray(image.crop((middle, 0, width, height)))
     # The released PNGs use yellow for the band below the green retina.
     # The article shows a different palette for the annotation workflow.
-    return scan, labels
-
-
-def load_scan_and_mask(archive, member):
-    scan, labels = load_scan_and_labels(archive, member)
     return scan, (labels == (255, 255, 0)).all(axis=2)
 
 

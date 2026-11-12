@@ -10,18 +10,6 @@
 * **OCT pre-adapter + true grayscale pipeline** in `src/rfa_u_net.py` / `src/dataset.py`
   * Helps stabilize **multi-device / multi-scanner OCT** variation (especially **contrast / brightness** shift) before RETFound patch embedding
 
-## Trained choroid refiner
-
-The standalone model scored **0.965 Dice versus 0.842 for Choroidalyzer v1.0** on 95 held-out OIMHS patients, with axial thickness error of **3.00 versus 7.82 pixels**. It runs through the existing segmentation and evaluation commands. A separate hybrid checkpoint refines a frozen Choroidalyzer prediction.
-
-```bash
-python src/rfa_u_net.py --weights_type refiner \
-  --segment_dir data/images --output_dir runs/refiner --save_overlay \
-  --measurements_csv runs/refiner/thickness.csv
-```
-
-The bundled checkpoint supplies its validation-selected inference settings. Use `--test_only` with labeled image and mask folders to evaluate a new cohort. See [the head-to-head benchmark](benchmarks/REFINER.md) for the patient split, comparison with Choroidalyzer, and reproduction instructions.
-
 ---
 
 ## 🚀 Key Features
@@ -467,7 +455,7 @@ if missing and `--weights_type rfa-unet` is used.
 
 ## Boundary refinement and thickness export
 
-`--tta_hflip` averages predictions after restoring their orientation. RFA-U-Net averages probabilities, and the trained refiner averages logits. It runs two model passes. `--postprocess layer` keeps the largest connected region and fills holes within its occupied columns. Both options are available for labeled evaluation and batch segmentation. Choose thresholds and refinement on a validation cohort because interrupted annotations and low-signal scans can behave differently.
+`--tta_hflip` averages the original and horizontally flipped predictions after restoring their orientation. It runs two model passes. `--postprocess layer` keeps the largest connected region and fills holes within its occupied columns. Both options are available for labeled evaluation and batch segmentation. Choose thresholds and refinement on a validation cohort because interrupted annotations and low-signal scans can behave differently.
 
 ```bash
 python src/rfa_u_net.py \
