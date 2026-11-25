@@ -2,7 +2,10 @@
 
 **RFA-U-Net** is a deep learning model to segment the **choroid** in Optical Coherence Tomography (OCT) images. It uses a **RETFound**-pretrained Vision Transformer (ViT) encoder and an **Attention U-Net** decoder, trained with Tversky/Dice losses and evaluated via Dice scores and micrometer-scale boundary errors.
 
-**Last updated: 2026-02-22**
+**Last updated: 2026-11-25**
+
+The [Optovue architecture report](reports/optovue-architecture.md) compares rectangular inputs, normalization, shallow fusion, and probability averaging for RFA-U-Net. It cites the [external Optovue dataset](https://doi.org/10.5281/zenodo.7618624) and details the adaptation split.
+
 🆕 New:
 * **Segmentation-only mode** for unlabeled OCT images via `--segment_dir` (no masks needed)
 * **Unified CNN/SOTA training and evaluation runner** via `src/cnn_sota_unet_models.py`
