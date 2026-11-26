@@ -25,3 +25,9 @@ The downloadable checkpoint achieved **83.64% mean Dice** on 439 external Optovu
 
 - [Training, fine-tuning, and evaluation](docs/usage.md)
 - [Research paper](https://doi.org/10.1101/2025.05.03.25326923) · [MIT license](LICENSE)
+
+## Contact and contributors
+
+Project contributors include Alireza Hayati, Roya Arian, and Narges Saeedizadeh.
+
+For project questions, email [alirezahayati17@yahoo.com](mailto:alirezahayati17@yahoo.com).
