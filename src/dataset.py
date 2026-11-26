@@ -1,75 +1,100 @@
 import os
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
 
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
+
+
+def image_paths(directory):
+    return sorted(str(path) for path in Path(directory).iterdir()
+                  if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+
+
+def index_by_stem(paths):
+    indexed = {}
+    for path in paths:
+        stem = Path(path).stem
+        if stem in indexed:
+            raise ValueError(f"Duplicate image or mask stem: {indexed[stem]} and {path}")
+        indexed[stem] = path
+    return indexed
+
+
 class OCTDataset(torch.utils.data.Dataset):
-    def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2, image_mode='rgb'):
-        self.image_size  = image_size
-        self.transform   = transform
+    def __init__(self, image_dir, mask_dir, image_size, transform=None, num_classes=2,
+                 image_mode='rgb', strict_pairs=False):
+        self.image_size = image_size
+        self.transform = transform
         self.num_classes = num_classes
         self.image_mode = str(image_mode).strip().lower()
         if self.image_mode not in {'rgb', 'gray'}:
             raise ValueError(f"image_mode must be 'rgb' or 'gray', got {image_mode}")
 
-        # Supported extensions
-        exts = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-
-        # Build mapping from basename → filename for images
-        image_map = {}
-        for fname in os.listdir(image_dir):
-            base, ext = os.path.splitext(fname)
-            if ext.lower() in exts:
-                image_map[base] = fname
-
-        # Build mapping from basename → filename for masks.
-        # Supports both exact stem matches and "<stem>_mask" naming.
-        mask_map = {}
-        for fname in os.listdir(mask_dir):
-            base, ext = os.path.splitext(fname)
-            if ext.lower() in exts:
-                # Exact key
-                if base not in mask_map:
-                    mask_map[base] = fname
-                # Common pattern: image stem + "_mask"
-                if base.endswith('_mask'):
-                    base_stripped = base[:-5]
-                    if base_stripped and base_stripped not in mask_map:
-                        mask_map[base_stripped] = fname
-
-        # Keep only basenames present in both
-        common_bases = sorted(set(image_map.keys()) & set(mask_map.keys()))
-
-        # Prepare full paths
-        self.image_paths = [os.path.join(image_dir, image_map[b]) for b in common_bases]
-        self.mask_paths  = [os.path.join(mask_dir,  mask_map[b]) for b in common_bases]
+        images = index_by_stem(image_paths(image_dir))
+        masks = index_by_stem(image_paths(mask_dir))
+        self.image_paths = []
+        self.mask_paths = []
+        unpaired = []
+        for stem, image in sorted(images.items()):
+            mask = masks.get(stem, masks.get(stem + '_mask'))
+            if mask is None:
+                unpaired.append(os.path.basename(image))
+                continue
+            self.image_paths.append(image)
+            self.mask_paths.append(mask)
+        if not self.image_paths or (strict_pairs and unpaired):
+            raise ValueError(
+                f"Expected paired OCT images and masks in {image_dir} and {mask_dir}. "
+                f"Found {len(self.image_paths)} pairs and {len(unpaired)} unpaired images "
+                f"({', '.join(unpaired[:5])})."
+            )
+        if unpaired:
+            print(f"Warning: skipping {len(unpaired)} training images without a matching mask.")
 
     def __len__(self):
         return len(self.image_paths)
 
-    def __getitem__(self, idx):
-        # paths
-        img_path  = self.image_paths[idx]
+    def load_pair(self, idx):
+        img_path = self.image_paths[idx]
         mask_path = self.mask_paths[idx]
+        image = load_scan(img_path, self.image_mode)
+        with Image.open(mask_path) as source:
+            mask = source.convert('L')
+        if image.size != mask.size:
+            raise ValueError(f"Image and mask dimensions differ for {img_path}: {image.size} vs {mask.size}.")
+        return image, mask
 
-        # load
-        pil_mode = 'L' if self.image_mode == 'gray' else 'RGB'
-        image    = Image.open(img_path).convert(pil_mode)
-        mask_pil = Image.open(mask_path).convert('L')
+    def __getitem__(self, idx):
+        image, mask = self.load_pair(idx)
         if self.transform:
-            # Preferred path: joint image/mask transform.
             try:
-                image_t, mask_t = self.transform(image, mask_pil)
-                return image_t, mask_t
+                return self.transform(image, mask)
             except TypeError:
-                # Backward-compatible path: image-only transform.
+                # Support legacy image-only transforms.
                 image = self.transform(image)
 
-        # Fallback path (no transform or image-only transform): resize + one-hot mask here.
-        mask_np = (np.array(mask_pil) > 0).astype(np.uint8)
-        mask_pil = Image.fromarray(mask_np).resize((self.image_size, self.image_size), resample=Image.NEAREST)
-        mask_np = np.array(mask_pil)
-        mask_tensor = torch.from_numpy(mask_np).long()
+        mask = mask.resize((self.image_size, self.image_size), resample=Image.Resampling.NEAREST)
+        mask_tensor = torch.from_numpy(np.array(mask) > 0).long()
         mask_onehot = F.one_hot(mask_tensor, num_classes=self.num_classes).permute(2, 0, 1).float()
         return image, mask_onehot
+
+
+def load_scan(path, image_mode):
+    with Image.open(path) as source:
+        if source.mode.startswith("I;16") or source.mode in {"I", "F"}:
+            pixels = np.asarray(source, dtype=np.float32)
+            finite = np.isfinite(pixels)
+            if not finite.any():
+                raise ValueError(f"No finite intensity values in {path}.")
+            low, high = np.percentile(pixels[finite], [0.5, 99.5])
+            if high <= low:
+                low, high = pixels[finite].min(), pixels[finite].max()
+            scaled = np.zeros(pixels.shape, dtype=np.uint8)
+            if high > low:
+                scaled[finite] = (np.clip((pixels[finite] - low) / (high - low), 0, 1) * 255).round()
+            return Image.fromarray(scaled).convert('L' if image_mode == 'gray' else 'RGB')
+        return source.convert('L' if image_mode == 'gray' else 'RGB')

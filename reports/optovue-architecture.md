@@ -1,6 +1,6 @@
 # RFA-U-Net architecture and inference on Optovue OCT
 
-The five-model RFA-U-Net ensemble reached **93.29% mean choroid Dice** in the Optovue adaptation experiment. The single general-purpose A06 release candidate scored **83.64%** on the complete 439-scan cohort before any Optovue fine-tuning. The two evaluations use different scan sets and answer different questions. The general checkpoint was designated using the highest development-validation Dice among the five original A06 runs.
+The five-model RFA-U-Net ensemble reached **93.29% mean choroid Dice** in the Optovue adaptation experiment. The general-purpose A06 download scored **83.64%** on the complete 439-scan cohort before any Optovue fine-tuning. The two evaluations use different scan sets and answer different questions. The general checkpoint was designated using the highest development-validation Dice among the five original A06 runs.
 
 ## External dataset and evaluation
 
@@ -24,4 +24,4 @@ With ImageNet normalization disabled, the rectangular grid increased Dice by **0
 
 ## General-purpose A06 checkpoint
 
-The general-purpose release candidate uses 224 × 224 RGB input, ImageNet normalization, the gray-edge pre-adapter, and the attention decoder with token-pyramid skips. It uses a single checkpoint and can run on other OCT datasets. Its accuracy on additional scanners and clinical populations requires evaluation. On all 439 Optovue scans, the five original A06 checkpoints averaged **84.74% Dice** and the single release candidate scored **83.64% Dice** with the same native-resolution scoring and threshold.
+The downloadable model uses 224 × 224 RGB input, ImageNet normalization, the gray-edge pre-adapter, and the attention decoder with token-pyramid skips. It uses a single checkpoint and can run on other OCT datasets. Its accuracy on additional scanners and clinical populations requires evaluation. On all 439 Optovue scans, the five original A06 checkpoints averaged **84.74% Dice** and the downloadable checkpoint scored **83.64% Dice** with the same native-resolution scoring and threshold. [Download and inference instructions](../weights/README.md)

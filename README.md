@@ -2,17 +2,9 @@
 
 **RFA-U-Net** is a deep learning model to segment the **choroid** in Optical Coherence Tomography (OCT) images. It uses a **RETFound**-pretrained Vision Transformer (ViT) encoder and an **Attention U-Net** decoder, trained with Tversky/Dice losses and evaluated via Dice scores and micrometer-scale boundary errors.
 
-**Last updated: 2026-11-25**
+**Last updated: 2026-11-26**
 
-The [Optovue architecture report](reports/optovue-architecture.md) compares rectangular inputs, normalization, shallow fusion, and probability averaging for RFA-U-Net. It cites the [external Optovue dataset](https://doi.org/10.5281/zenodo.7618624) and details the adaptation split.
-
-🆕 New:
-* **Segmentation-only mode** for unlabeled OCT images via `--segment_dir` (no masks needed)
-* **Unified CNN/SOTA training and evaluation runner** via `src/cnn_sota_unet_models.py`
-* **RFA-U-Net ablation-study presets** in `src/rfa_u_net.py` via `--ablation_preset`
-* **OCT pre-adapter + true grayscale pipeline** in `src/rfa_u_net.py` / `src/dataset.py`
-  * Helps stabilize **multi-device / multi-scanner OCT** variation (especially **contrast / brightness** shift) before RETFound patch embedding
-
+The default download is **RFA-U-Net A06 General v1**, a single 224 × 224 RGB checkpoint. The [Optovue architecture report](reports/optovue-architecture.md) documents the effect of rectangular inputs, normalization, and probability averaging in a separate adaptation experiment. [Download and inference instructions](weights/README.md)
 ---
 
 ## 🚀 Key Features
@@ -22,7 +14,7 @@ The [Optovue architecture report](reports/optovue-architecture.md) compares rect
 * **🆕 OCT pre-adapter (optional, recommended)**:
   * `--use_pre_adapter --pre_adapter_mode gray_edge --pre_adapter_norm in`
   * Adds anti-aliased resize + OCT-oriented intensity correction + edge-preserving input alignment before RETFound
-  * Improves robustness to scanner/domain intensity shifts (contrast/brightness differences)
+  * Designed to address scanner-dependent contrast and brightness shifts
 * **Losses**: Tversky + Dice to handle class imbalance
 * **Metrics**:
 
@@ -52,7 +44,7 @@ RFA-U-Net/
 │   └── util/
 │       └── pos_embed.py      # Positional embedding utils
 ├── examples/
-│   └── visualization.ipynb   # Qualitative demo notebook
+│   └── visualization.py      # Qualitative demo script
 ├── weights/
 │   └── README.md             # How to download pretrained weights
 ├── requirements.txt
@@ -63,24 +55,11 @@ RFA-U-Net/
 
 ## ⚙️ Requirements
 
-* Python 3.8+
-* PyTorch 1.9+
+* Python 3.10+
+* PyTorch 2.7+
 * NVIDIA GPU recommended
 
-See `requirements.txt` for full list:
-
-```text
-torch>=1.9.0
-torchvision>=0.10.0
-numpy>=1.19.0
-matplotlib>=3.3.0
-scikit-learn>=0.24.0
-timm>=0.4.12
-huggingface-hub>=0.14.1
-gdown>=4.7.1
-Pillow>=8.0.0
-rarfile>=4.0
-```
+See [requirements.txt](requirements.txt) for the full dependency list.
 
 ---
 
@@ -121,37 +100,40 @@ data/
 
 ---
 
-## 🎯 External-Data-Only Testing (with Masks)
+## External evaluation
 
-Evaluate pre-trained RFA-U-Net on your own **labeled** data (no further training):
+Evaluate a trained checkpoint against native-resolution binary masks. Image and mask dimensions must match. The CLI writes one row per scan and reports Dice, Jaccard, Bruch’s membrane (BM) and choroid–sclera interface (CSI) errors, axial thickness error, and reference-column coverage.
 
 ```bash
 python src/rfa_u_net.py \
   --test_only \
-  --test_image_dir path/to/images \
-  --test_mask_dir  path/to/masks \
+  --test_image_dir data/external/images \
+  --test_mask_dir data/external/masks \
   --weights_type rfa-unet \
-  --threshold 0.5 \
-  --pixel_size_micrometers 12.5
+  --metadata_csv data/external/scans.csv \
+  --metrics_csv runs/external.csv
 ```
 
-Key arguments:
+The CSV uses exact image filenames and stable, de-identified patient IDs. The scanner and native axial pixel size are optional. Use a separate manifest for each external cohort.
 
-* `--test_only`: skip training, run evaluation only
-* `--threshold`: binarization cutoff (default `0.5`)
-* `--pixel_size_micrometers`: μm/pixel for boundary error computation (default `10.35`)
-
-**Sample output**:
-
-```text
-Choroid Dice on external data: 0.9523
-Upper signed/unsigned error: -0.85/5.90 μm
-Lower signed/unsigned error:  1.12/20.50 μm
+```csv
+image,patient_id,scanner,axial_um_per_pixel
+scan01.png,p001,Spectralis,3.87
+scan02.png,p001,Spectralis,3.87
+scan03.png,p002,Triton,2.60
 ```
+
+The physical values above are examples. Use each exported scan’s actual axial calibration. When all scans share one known calibration, `--pixel_size_micrometers` supplies a fallback. Scans without calibration are reported in pixels. Boundary errors use columns present in both prediction and reference. A missed scan contributes to Dice and coverage, and its boundary errors are blank. With patient IDs, the report averages scans within each patient and then averages patients. Scanner summaries use the same procedure within each scanner.
+
+The released checkpoint restores its historical RGB preprocessing and decoder automatically. Newly trained checkpoints carry their own architecture and input preprocessing. For older custom checkpoints without metadata, pass the architecture and preprocessing flags used during training.
 
 ---
 
 ## 🧠 Training & Inference (with Masks)
+
+Supply `--metadata_csv` to keep every patient’s scans in one partition. Training selects the best checkpoint on validation Dice and then evaluates the held-out partition. Explicit validation folders are checked for shared patient IDs when metadata is provided. With multiple scans per patient, use patient grouping or explicit patient-disjoint folders.
+
+The training loss can add `--thickness_loss_weight 0.5` to penalize differences between predicted and reference axial thickness. This is an experimental starting weight. The existing `--edge_loss_weight` can be tested separately. Compare candidates using the same patient splits, then freeze the settings before evaluating the external cohort.
 
 ### 1️⃣ Train from scratch (no pre-training)
 
@@ -405,7 +387,6 @@ This mode runs **pure inference** on *unlabeled* OCT images: it loads a trained 
 python src/rfa_u_net.py \
   --segment_dir path/to/unlabeled_images \
   --weights_type rfa-unet \
-  --weights_path weights/best_rfa_unet.pth \
   --output_dir segment_results \
   --batch_size 4 \
   --threshold 0.5 \
@@ -424,7 +405,7 @@ python src/rfa_u_net.py \
   * Can also use `retfound` if you trained a custom checkpoint
 * `--weights_path`
 
-  * Path to the `.pth` checkpoint (defaults to `weights/best_rfa_unet.pth`)
+  * Path to a local `.pth` checkpoint. Omitting this flag uses the A06 General v1 checkpoint.
 * `--output_dir`
 
   * Base directory where results are saved (default: `segment_results`)
@@ -448,25 +429,37 @@ The script prints per-image debug info (prediction stats, resize shapes) and war
 
 ---
 
-## 📥 Download Link for RFA-U-Net Pretrained Weights
+## Download the pretrained model
 
-### URL for pretrained weights (Google Drive link)
+[Download RFA-U-Net A06 General v1](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) · 1.36 GB
 
-```text
-RFA_UNET_WEIGHTS_URL = "https://drive.google.com/uc?export=download&id=1zDEdAmNwNK8I-QEa6fqL5E3WjDn7Z-__"
+RFA-U-Net downloads A06 General v1 to `weights/RFA-U-Net-A06-General-v1.pth` and verifies its SHA-256 checksum. The file includes its inference settings. [Checkpoint and checksum](weights/README.md)
+
+The [external Optovue cohort](https://doi.org/10.5281/zenodo.7618624) scored **83.64% Dice** across 439 scans with the downloadable checkpoint. The [architecture report](reports/optovue-architecture.md) covers the Optovue adaptation experiment.
+
+## Boundary refinement and thickness export
+
+`--tta_hflip` averages the original and horizontally flipped predictions after restoring their orientation. It runs two model passes. `--postprocess layer` keeps the largest connected region and fills holes within its occupied columns. Both options are available for labeled evaluation and batch segmentation. Choose thresholds and refinement on a validation cohort because interrupted annotations and low-signal scans can behave differently.
+
+```bash
+python src/rfa_u_net.py \
+  --segment_dir data/images \
+  --weights_type rfa-unet \
+  --save_overlay \
+  --output_dir runs/segmentation \
+  --metadata_csv data/scans.csv \
+  --measurements_csv runs/segmentation/thickness.csv
 ```
 
-The script will automatically download to:
+The thickness CSV contains mean and median axial thickness across occupied columns whose boundaries stay within the image. It also records missing and axially clipped columns through scan width, predicted columns and measured columns. The measurements describe the segmented B-scan. They are not fovea-centered or perpendicular-to-layer measurements.
 
-```text
-weights/best_rfa_unet.pth
-```
+## Public benchmark
 
-if missing and `--weights_type rfa-unet` is used.
+On 95 held-out OIMHS patients, horizontal flip averaging with `--threshold 0.35` improved mean Dice from 0.660 to 0.691 using the historical checkpoint documented in that benchmark. Choroidalyzer v1.0 scored 0.842 on the same scans. See [the reproducible OIMHS comparison](benchmarks/README.md) for boundary errors, the tuning split and scope.
 
----
+## Original study results
 
-## 📊 Results Snapshot
+The historical values below come from the original evaluation setup. The public OIMHS benchmark above uses a separate cohort and protocol. [RFA-U-Net preprint](https://doi.org/10.1101/2025.05.03.25326923)
 
 | Metric                    | Value |
 | ------------------------- | ----- |
@@ -487,13 +480,18 @@ if missing and `--weights_type rfa-unet` is used.
   * Predicted mask
   * Boundary overlay (true vs predicted; upper/lower boundaries)
 
-![Boundary overlay example](examples/sample_output.png)
+See [the visualization script](examples/visualization.py) for the four-panel example.
 
 Segmentation-only mode also creates overlay PNGs directly from your unlabeled OCTs (if `--save_overlay` is enabled).
 
 ---
 
 ## 📝 Changelog
+
+* **2026-11-26**
+
+  * Released [RFA-U-Net A06 General v1](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) as the default single-checkpoint download.
+  * Added checksum verification and documented the external Optovue benchmark. [Weights and inference](weights/README.md) · [Architecture report](reports/optovue-architecture.md)
 
 * **2026-02-22**
 
