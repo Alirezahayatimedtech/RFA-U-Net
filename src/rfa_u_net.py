@@ -706,7 +706,7 @@ def model_config(args):
 
 # Weights file paths
 RETFOUND_WEIGHTS_PATH = "weights/RETFound_oct_weights.pth"
-RFA_UNET_WEIGHTS_PATH = "weights/RFA-U-Net-A06-General-v1.pth"
+RFA_UNET_WEIGHTS_PATH = "weights/RFA-U-Net-Weights.pth"
 
 # URL for downloading RFA-U-Net weights
 
@@ -728,7 +728,7 @@ def download_default_weights(path):
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 checksum.update(chunk)
         if checksum.hexdigest() != RFA_UNET_WEIGHTS_SHA256:
-            raise ValueError("The downloaded A06 checkpoint failed SHA-256 verification.")
+            raise ValueError("The downloaded RFA-U-Net checkpoint failed SHA-256 verification.")
         os.replace(staging_path, path)
 
 def resolve_weights(args):

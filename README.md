@@ -4,7 +4,7 @@
 
 **Last updated: 2026-11-26**
 
-The default download is **RFA-U-Net A06 General v1**, a single 224 × 224 RGB checkpoint. The [Optovue architecture report](reports/optovue-architecture.md) documents the effect of rectangular inputs, normalization, and probability averaging in a separate adaptation experiment. [Download and inference instructions](weights/README.md)
+The default download is **RFA-U-Net Weights**, a single 224 × 224 RGB checkpoint. The [Optovue architecture report](reports/optovue-architecture.md) documents the effect of rectangular inputs, normalization, and probability averaging in a separate adaptation experiment. [Download and inference instructions](weights/README.md)
 ---
 
 ## 🚀 Key Features
@@ -405,7 +405,7 @@ python src/rfa_u_net.py \
   * Can also use `retfound` if you trained a custom checkpoint
 * `--weights_path`
 
-  * Path to a local `.pth` checkpoint. Omitting this flag uses the A06 General v1 checkpoint.
+  * Path to a local `.pth` checkpoint. Omitting this flag uses the default RFA-U-Net checkpoint.
 * `--output_dir`
 
   * Base directory where results are saved (default: `segment_results`)
@@ -431,9 +431,9 @@ The script prints per-image debug info (prediction stats, resize shapes) and war
 
 ## Download the pretrained model
 
-[Download RFA-U-Net A06 General v1](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) · 1.36 GB
+[Download RFA-U-Net Weights](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) · 1.36 GB
 
-RFA-U-Net downloads A06 General v1 to `weights/RFA-U-Net-A06-General-v1.pth` and verifies its SHA-256 checksum. The file includes its inference settings. [Checkpoint and checksum](weights/README.md)
+RFA-U-Net downloads the weights to `weights/RFA-U-Net-Weights.pth` and verifies its SHA-256 checksum. The file includes its inference settings. [Checkpoint and checksum](weights/README.md)
 
 The [external Optovue cohort](https://doi.org/10.5281/zenodo.7618624) scored **83.64% Dice** across 439 scans with the downloadable checkpoint. The [architecture report](reports/optovue-architecture.md) covers the Optovue adaptation experiment.
 
@@ -490,7 +490,7 @@ Segmentation-only mode also creates overlay PNGs directly from your unlabeled OC
 
 * **2026-11-26**
 
-  * Released [RFA-U-Net A06 General v1](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) as the default single-checkpoint download.
+  * Released [RFA-U-Net Weights](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) as the default single-checkpoint download.
   * Added checksum verification and documented the external Optovue benchmark. [Weights and inference](weights/README.md) · [Architecture report](reports/optovue-architecture.md)
 
 * **2026-02-22**

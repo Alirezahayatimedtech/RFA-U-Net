@@ -1,6 +1,6 @@
-# RFA-U-Net A06 General v1
+# RFA-U-Net Weights
 
-[Download RFA-U-Net-A06-General-v1.pth](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) · 1.36 GB
+[Download RFA-U-Net-Weights.pth](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) · 1.36 GB
 
 The single-model checkpoint includes the trained RETFound encoder, OCT pre-adapter, attention decoder, and settings for 224 × 224 RGB inference. The default CLI uses threshold 0.50. It downloads and verifies the file on first use.
 
@@ -8,7 +8,7 @@ The single-model checkpoint includes the trained RETFound encoder, OCT pre-adapt
 python src/rfa_u_net.py --segment_dir path/to/oct/images --weights_type rfa-unet
 ```
 
-The CLI writes native-resolution masks to `segment_results/masks/`. For an existing local copy, pass `--weights_path path/to/RFA-U-Net-A06-General-v1.pth`.
+The CLI writes native-resolution masks to `segment_results/masks/`. For an existing local copy, pass `--weights_path path/to/RFA-U-Net-Weights.pth`.
 
 SHA-256
 
