@@ -1,0 +1,492 @@
+# RFA-U-Net usage guide
+
+## Requirements
+
+* Python 3.10+
+* PyTorch 2.7+
+* NVIDIA GPU recommended
+
+See [requirements.txt](../requirements.txt) for the full dependency list.
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/Alirezahayatimedtech/RFA-U-Net.git
+cd RFA-U-Net
+pip install -r requirements.txt
+```
+
+### Hugging Face Authentication
+
+If you plan to load **RETFound** weights from HF Hub, set your token:
+
+```bash
+export HUGGINGFACE_HUB_TOKEN="hf_yourTokenHere"
+# or
+huggingface-cli login
+```
+
+---
+
+## Dataset Format (for Training / Test with Masks)
+
+```text
+data/
+├── images/
+│   ├── sample1.jpg
+│   └── sample2.jpg
+└── masks/
+    ├── sample1.png
+    └── sample2.png
+```
+
+* **Images**: RGB OCT scans (`.jpg`, `.png`, `.tif`, …)
+* **Masks**: Binary masks (`.png`) matching the image filenames (background/choroid as 2-channel one-hot internally)
+
+---
+
+## External evaluation
+
+Evaluate a trained checkpoint against native-resolution binary masks. Image and mask dimensions must match. The CLI writes one row per scan and reports Dice, Jaccard, Bruch’s membrane (BM) and choroid–sclera interface (CSI) errors, axial thickness error, and reference-column coverage.
+
+```bash
+python src/rfa_u_net.py \
+  --test_only \
+  --test_image_dir data/external/images \
+  --test_mask_dir data/external/masks \
+  --weights_type rfa-unet \
+  --metadata_csv data/external/scans.csv \
+  --metrics_csv runs/external.csv
+```
+
+The CSV uses exact image filenames and stable, de-identified patient IDs. The scanner and native axial pixel size are optional. Use a separate manifest for each external cohort.
+
+```csv
+image,patient_id,scanner,axial_um_per_pixel
+scan01.png,p001,Spectralis,3.87
+scan02.png,p001,Spectralis,3.87
+scan03.png,p002,Triton,2.60
+```
+
+The physical values above are examples. Use each exported scan’s actual axial calibration. When all scans share one known calibration, `--pixel_size_micrometers` supplies a fallback. Scans without calibration are reported in pixels. Boundary errors use columns present in both prediction and reference. A missed scan contributes to Dice and coverage, and its boundary errors are blank. With patient IDs, the report averages scans within each patient and then averages patients. Scanner summaries use the same procedure within each scanner.
+
+The default checkpoint includes its RGB preprocessing and decoder settings. Newly trained checkpoints carry their own architecture and input preprocessing. For older custom checkpoints without metadata, pass the architecture and preprocessing flags used during training.
+
+---
+
+## Training & Inference (with Masks)
+
+Supply `--metadata_csv` to keep every patient’s scans in one partition. Training selects the best checkpoint on validation Dice and then evaluates the held-out partition. Explicit validation folders are checked for shared patient IDs when metadata is provided. With multiple scans per patient, use patient grouping or explicit patient-disjoint folders.
+
+The training loss can add `--thickness_loss_weight 0.5` to penalize differences between predicted and reference axial thickness. This is an experimental starting weight. The existing `--edge_loss_weight` can be tested separately. Compare candidates using the same patient splits, then freeze the settings before evaluating the external cohort.
+
+### 1 Train from scratch (no pre-training)
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir  data/masks \
+  --weights_type none \
+  --num_epochs 30 \
+  --batch_size 4
+```
+
+### 2 Fine-tune with RETFound backbone
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir  data/masks \
+  --weights_type retfound \
+  --image_mode gray \
+  --use_pre_adapter \
+  --pre_adapter_mode gray_edge \
+  --pre_adapter_norm in \
+  --num_epochs 20 \
+  --batch_size 8
+```
+
+This will:
+
+* Download **RETFound** weights from HF Hub if missing
+* Initialize the ViT encoder from RETFound
+* Train the Attention U-Net decoder on your dataset
+
+### 2b Recommended OCT scanner-robust RETFound setup (contrast/brightness shift)
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir data/masks \
+  --weights_type retfound \
+  --image_mode gray \
+  --use_pre_adapter \
+  --pre_adapter_mode gray_edge \
+  --pre_adapter_norm in \
+  --pre_adapter_hidden_channels 8 \
+  --pre_adapter_depth 1 \
+  --pre_adapter_residual_scale_init 0.10 \
+  --num_epochs 50 \
+  --batch_size 8
+```
+
+Why this helps:
+* The **pre-adapter** reduces scanner-dependent **contrast/brightness** mismatch before tokenization.
+* `gray_edge` mode preserves boundary cues (important for thin choroid interfaces).
+* The **true grayscale pipeline** (`--image_mode gray`) avoids redundant replicated RGB channels for OCT.
+
+### 3 Fine-tune with pre-trained RFA-U-Net weights
+
+(Default downloads via `gdown` if not present)
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir  data/masks \
+  --weights_type rfa-unet \
+  --num_epochs 15 \
+  --batch_size 8
+```
+
+---
+
+## RFA-U-Net Ablation Study Protocol
+
+`src/rfa_u_net.py` now supports fixed ablation presets that isolate decoder components:
+
+* `baseline` (plain decoder)
+* `attention_only`
+* `fusion_only`
+* `upconvs_only`
+* `attention_fusion`
+* `attention_upconvs`
+* `fusion_upconvs`
+* `full` (attention + fusion + up-convs)
+
+List available presets:
+
+```bash
+python src/rfa_u_net.py --list_ablation_presets
+```
+
+Run one ablation:
+
+```bash
+python src/rfa_u_net.py \
+  --image_dir data/images \
+  --mask_dir data/masks \
+  --weights_type retfound \
+  --ablation_preset attention_fusion \
+  --num_epochs 150 \
+  --batch_size 8 \
+  --seed 42 \
+  --save_best_path weights/best_rfa_unet_attention_fusion.pth \
+  --ablation_results_csv runs/ablation_results.csv
+```
+
+Run the full 8-preset sweep:
+
+```bash
+for p in baseline attention_only fusion_only upconvs_only attention_fusion attention_upconvs fusion_upconvs full; do
+  python src/rfa_u_net.py \
+    --image_dir data/images \
+    --mask_dir data/masks \
+    --weights_type retfound \
+    --ablation_preset "$p" \
+    --num_epochs 150 \
+    --batch_size 8 \
+    --seed 42 \
+    --save_best_path "weights/best_rfa_unet_${p}.pth" \
+    --ablation_results_csv runs/ablation_results.csv
+done
+```
+
+Useful ablation flags:
+
+* `--ablation_preset`: choose one of the 8 presets
+* `--save_best_path`: set preset-specific checkpoint path
+* `--ablation_results_csv`: append final metrics row per run
+* `--seed`: fixed split seed for reproducible comparisons
+
+---
+
+## 🆕 Unified CNN + SOTA U-Net Runner
+
+This repository now includes `src/cnn_sota_unet_models.py`, a single CLI for:
+
+* training (`--mode train`)
+* evaluation (`--mode eval`)
+* prediction/export masks (`--mode predict`)
+
+across **7 CNN-U-Net baselines** + **3 SOTA models**:
+
+* `cnn_attention_unet_vit`
+* `cnn_inception_unet`
+* `cnn_alexnet_unet`
+* `cnn_unet_vgg16`
+* `cnn_unet_vgg19`
+* `cnn_unet_resnet50`
+* `cnn_unet_resnet101`
+* `sota_pgkd`
+* `sota_deepgpet`
+* `sota_unet_bem`
+
+### Key additions in this script
+
+* notebook-aligned preprocessing defaults by model (`--notebook-defaults`)
+* model-specific loss/metric defaults (`--loss auto`, `--metric-profile auto`)
+* checkpointing + resume
+* optional layer freezing for transfer learning
+* scheduler support (`none`, `plateau`, `step`)
+* multiple Dice/IoU evaluation areas:
+  * `--metric-area full`
+  * `--metric-area gt_choroid_columns`
+  * `--metric-area union_choroid_columns`
+
+### Important dependency note for SOTA models
+
+For `sota_pgkd`, `sota_deepgpet`, and `sota_unet_bem`, ensure required external repos/modules are importable (e.g., via `PYTHONPATH`) before running.
+
+### Quick usage
+
+List model IDs and defaults:
+
+```bash
+python src/cnn_sota_unet_models.py --list-models
+```
+
+Train a CNN baseline (example: ResNet50 U-Net):
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode train \
+  --model-id cnn_unet_resnet50 \
+  --image-dir data/train/training/images \
+  --mask-dir data/train/training/labels \
+  --output-dir runs/cnn_unet_resnet50 \
+  --epochs 150 \
+  --batch-size 8 \
+  --lr 1e-4 \
+  --loss weighted_ce \
+  --class-weights 1.0,2.0 \
+  --scheduler plateau \
+  --monitor dice \
+  --augment \
+  --notebook-defaults
+```
+
+Train DeepGPET:
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode train \
+  --model-id sota_deepgpet \
+  --image-dir data/train/training/images \
+  --mask-dir data/train/training/labels \
+  --output-dir runs/sota_deepgpet \
+  --epochs 150 \
+  --batch-size 4 \
+  --lr 1e-3 \
+  --loss bce_logits \
+  --scheduler plateau \
+  --monitor dice \
+  --augment \
+  --notebook-defaults
+```
+
+Evaluate on a labeled test set with strict union metric area:
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode eval \
+  --model-id sota_pgkd \
+  --image-dir data/train/test/images \
+  --mask-dir data/train/test/labels \
+  --checkpoint runs/sota_pgkd/sota_pgkd_best.pth \
+  --save-metrics-path runs/sota_pgkd/test_metrics.json \
+  --metric-area union_choroid_columns \
+  --notebook-defaults
+```
+
+Predict masks for unlabeled images:
+
+```bash
+python src/cnn_sota_unet_models.py \
+  --mode predict \
+  --model-id cnn_inception_unet \
+  --predict-image-dir path/to/images \
+  --checkpoint runs/cnn_inception_unet/cnn_inception_unet_best.pth \
+  --output-dir runs/cnn_inception_unet/predict_out \
+  --notebook-defaults
+```
+
+---
+
+## 🆕 Segmentation-Only Mode (No Masks Required)
+
+This mode runs **pure inference** on *unlabeled* OCT images: it loads a trained model and saves segmentation masks (and optional overlays) to disk.
+
+### CLI Example
+
+```bash
+python src/rfa_u_net.py \
+  --segment_dir path/to/unlabeled_images \
+  --weights_type rfa-unet \
+  --output_dir segment_results \
+  --batch_size 4 \
+  --threshold 0.5 \
+  --save_overlay
+```
+
+**Arguments specific to segmentation-only:**
+
+* `--segment_dir` **(required for this mode)**
+
+  * Path to a folder with OCT images (no masks needed)
+  * Supported extensions: `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`
+* `--weights_type`
+
+  * Recommended: `rfa-unet` (use a trained RFA-U-Net checkpoint)
+  * Can also use `retfound` if you trained a custom checkpoint
+* `--weights_path`
+
+  * Path to a local `.pth` checkpoint. Omitting this flag uses the default RFA-U-Net checkpoint.
+* `--output_dir`
+
+  * Base directory where results are saved (default: `segment_results`)
+* `--threshold`
+
+  * Probability cutoff for binarizing choroid predictions (default: `0.5`)
+* `--save_overlay`
+
+  * If set, saves RGB overlays with choroid boundaries drawn on the original image
+
+**What gets saved:**
+
+* `output_dir/masks/`
+
+  * `_mask.png` files: binary choroid masks resized to each image’s **original size**
+* `output_dir/overlays/` (only if `--save_overlay` is used)
+
+  * `_overlay.png` files: original image with choroid **boundaries** drawn in color
+
+The script prints per-image debug info (prediction stats, resize shapes) and warns if a mask is all black (no pixels above threshold).
+
+---
+
+## Download the pretrained model
+
+[Download RFA-U-Net Weights](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) · 1.36 GB
+
+RFA-U-Net downloads the weights to `weights/RFA-U-Net-Weights.pth` and verifies its SHA-256 checksum. The file includes its inference settings. [Checkpoint and checksum](../weights/README.md)
+
+The [external Optovue cohort](https://doi.org/10.5281/zenodo.7618624) scored **83.64% Dice** across 439 scans with the downloadable checkpoint. The [architecture report](../reports/optovue-architecture.md) covers the Optovue adaptation experiment.
+
+## Boundary refinement and thickness export
+
+`--tta_hflip` averages the original and horizontally flipped predictions after restoring their orientation. It runs two model passes. `--postprocess layer` keeps the largest connected region and fills holes within its occupied columns. Both options are available for labeled evaluation and batch segmentation. Choose thresholds and refinement on a validation cohort because interrupted annotations and low-signal scans can behave differently.
+
+```bash
+python src/rfa_u_net.py \
+  --segment_dir data/images \
+  --weights_type rfa-unet \
+  --save_overlay \
+  --output_dir runs/segmentation \
+  --metadata_csv data/scans.csv \
+  --measurements_csv runs/segmentation/thickness.csv
+```
+
+The thickness CSV contains mean and median axial thickness across occupied columns whose boundaries stay within the image. It also records missing and axially clipped columns through scan width, predicted columns and measured columns. The measurements describe the segmented B-scan. They are not fovea-centered or perpendicular-to-layer measurements.
+
+## Public benchmark
+
+On 95 held-out OIMHS patients, horizontal flip averaging with `--threshold 0.35` improved mean Dice from 0.660 to 0.691 using the historical checkpoint documented in that benchmark. Choroidalyzer v1.0 scored 0.842 on the same scans. See [the reproducible OIMHS comparison](../benchmarks/README.md) for boundary errors, the tuning split and scope.
+
+## Original study results
+
+The historical values below come from the original evaluation setup. The public OIMHS benchmark above uses a separate cohort and protocol. [RFA-U-Net preprint](https://doi.org/10.1101/2025.05.03.25326923)
+
+| Metric                    | Value |
+| ------------------------- | ----- |
+| Dice Score (choroid)      | ~0.95 |
+| Upper Signed Error (μm)   | ~–0.9 |
+| Upper Unsigned Error (μm) | ~6.0  |
+| Lower Signed Error (μm)   | ~1.1  |
+| Lower Unsigned Error (μm) | ~21.4 |
+
+---
+
+## Example Outputs
+
+* **Four-panel visualization**:
+
+  * Original OCT
+  * Ground-truth mask
+  * Predicted mask
+  * Boundary overlay (true vs predicted; upper/lower boundaries)
+
+See [the visualization script](../examples/visualization.py) for the four-panel example.
+
+Segmentation-only mode also creates overlay PNGs directly from your unlabeled OCTs (if `--save_overlay` is enabled).
+
+---
+
+## Changelog
+
+* **2026-11-26**
+
+  * Released [RFA-U-Net Weights](https://drive.google.com/file/d/16LOpbw0lVi7JyehSJcQr9M7Q_uZjrlXP/view) as the default single-checkpoint download.
+  * Added checksum verification and documented the external Optovue benchmark. [Weights and inference](../weights/README.md) · [Architecture report](../reports/optovue-architecture.md)
+
+* **2026-02-22**
+
+  * Added **OCT pre-adapter** documentation (`--use_pre_adapter`, `--pre_adapter_mode gray_edge`, `--pre_adapter_norm in`)
+  * Documented pre-adapter rationale for **multi-device / multi-scanner OCT** robustness (contrast / brightness shift)
+  * Added **true grayscale pipeline** usage (`--image_mode gray`) for OCT training/inference
+  * Updated README examples to reflect current RETFound + OCT-pre-adapter usage
+
+* **2026-02-11**
+
+  * Added `src/cnn_sota_unet_models.py` for unified CNN + SOTA training/evaluation/prediction
+  * Added RFA-U-Net ablation protocol in `src/rfa_u_net.py`:
+    * `--ablation_preset` with 8 predefined component combinations
+    * `--list_ablation_presets` for quick preset discovery
+    * `--save_best_path` for per-ablation checkpoint management
+    * `--ablation_results_csv` to append comparable ablation metrics
+  * Added model registry for 7 CNN-U-Net baselines + 3 SOTA models
+  * Added notebook-aligned preprocessing profiles per model
+  * Added configurable metric area support:
+    * `full`
+    * `gt_choroid_columns`
+    * `union_choroid_columns`
+  * Added scheduler, layer-freezing, checkpoint resume, and CLI documentation in README
+
+* **2025-11-13**
+
+  * Added **segmentation-only mode** via `--segment_dir`
+  * New output utilities:
+
+    * Save per-image masks and overlays
+    * Preserve original image resolution for saved masks
+  * Updated README to document segmentation-only usage
+
+---
+
+## Contact & Citation
+
+Hayati *et al.* “RFA-U-Net: Choroid Segmentation in OCT with RETFound Attention U-Net,” *medRxiv* (2025).
+DOI: `10.1101/2025.05.03.25326923`
+
+For issues or questions, open a GitHub Issue or email **[alirezahayati17@yahoo.com](mailto:alirezahayati17@yahoo.com)**.
+
+---
+
+## ‍ Contributors
+
+* **Alireza Hayati** – Lead developer
+* **Roya Arian** – Mentor
+* **Narges Sa** – Mentor
+
+MIT License. See [LICENSE](../LICENSE).
